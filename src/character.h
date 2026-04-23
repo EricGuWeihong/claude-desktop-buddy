@@ -1,5 +1,9 @@
 #pragma once
+#include <M5GFX.h>
 #include <stdint.h>
+
+using TFT_eSprite = LGFX_Sprite;
+using TFT_eSPI = lgfx::LGFXBase;
 
 struct Palette {
   uint16_t body, bg, text, textDim, ink;
@@ -24,7 +28,6 @@ void characterClose();   // close GIF + clear loaded flag; FS stays mounted   //
 // header strip; off renders full-size centered in the upper home area.
 // Adaptive to actual canvas height — no padding required in source art.
 void characterSetPeek(bool peek);
-class TFT_eSPI;
 void characterRenderTo(TFT_eSPI* tgt, int cx, int cy);
 
 const Palette& characterPalette();

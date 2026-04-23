@@ -1,5 +1,12 @@
 #pragma once
+#include <Arduino.h>
+#include <M5GFX.h>
 #include <stdint.h>
+
+// M5GFX does not provide TFT_eSprite/TFT_eSPI. Use LGFX_Sprite for sprites
+// and lgfx::LGFXBase as the common base for render-to-surface functions.
+using TFT_eSprite = LGFX_Sprite;
+using TFT_eSPI = lgfx::LGFXBase;
 
 // Shared constants and helpers for buddy species files.
 // Each species file (src/buddies/<name>.cpp) includes this header
