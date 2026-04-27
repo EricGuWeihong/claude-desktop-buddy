@@ -36,6 +36,8 @@ static uint32_t _lastDaemonMs = 0;   // heartbeat from CLI daemon
 static uint32_t _lastUsbMs = 0;      // last USB data (hooks + heartbeat)
 static char     _daemonOs[12] = "";   // "macOS", "Windows", "Linux"
 static char     _daemonPort[20] = ""; // e.g. "/dev/cu.usbmodem1101"
+static uint32_t _daemonConnectMs = 0; // first heartbeat timestamp (uptime origin)
+static uint32_t _btConnectMs = 0;     // first BLE data timestamp (uptime origin)
 static bool     _demoMode   = false;
 
 // Accessors for main.cpp to read daemon metadata (static vars aren't shared
@@ -45,6 +47,8 @@ inline const char* dataDaemonOs() { return _daemonOs; }
 inline const char* dataDaemonPort() { return _daemonPort; }
 inline uint32_t dataBtByteMs()    { return _lastBtByteMs; }
 inline uint32_t dataUsbMs()       { return _lastUsbMs; }
+inline uint32_t dataDaemonConnectMs() { return _daemonConnectMs; }
+inline uint32_t dataBtConnectMs()     { return _btConnectMs; }
 static uint8_t  _demoIdx    = 0;
 static uint32_t _demoNext   = 0;
 
@@ -129,13 +133,19 @@ static void _applyJson(const char* line, TamaState* out) {
   // triggering any other state change. Includes "transport" to identify the
   // link medium (usb/bt/wifi).
   if (doc["daemon"].is<unsigned int>()) {
-    _lastDaemonMs = millis();
+    uint32_t now = millis();
+    // Track first heartbeat as connection start time.
+    if (_daemonConnectMs == 0) _daemonConnectMs = now;
+    _lastDaemonMs = now;
     // Track transport from heartbeat so we know which link the CLI daemon
     // is using. Default to USB for legacy daemons that don't send it.
     const char* tr = doc["transport"];
-    if (tr && strcmp(tr, "bt") == 0) _lastBtByteMs = millis();
+    if (tr && strcmp(tr, "bt") == 0) {
+      if (_btConnectMs == 0) _btConnectMs = now;
+      _lastBtByteMs = now;
+    }
     else if (tr && strcmp(tr, "wifi") == 0) {} // WiFi tracked separately
-    else _lastUsbMs = millis();
+    else _lastUsbMs = now;
     // Capture OS and port for display on TRANSPORT info page.
     const char* os = doc["os"];
     if (os) { strncpy(_daemonOs, os, sizeof(_daemonOs)-1); _daemonOs[sizeof(_daemonOs)-1]=0; }
@@ -150,6 +160,8 @@ static void _applyJson(const char* line, TamaState* out) {
     strncpy(out->msg, doc["msg"] ? doc["msg"].as<const char*>() : "ready", sizeof(out->msg)-1);
     out->msg[sizeof(out->msg)-1] = 0;
     _lastLiveMs = millis();
+    _daemonConnectMs = 0;  // daemon restart — reset uptime
+    _btConnectMs = 0;
     return;
   }
 
@@ -271,7 +283,9 @@ inline void dataPoll(TamaState* out) {
   while (bleAvailable()) {
     int c = bleRead();
     if (c < 0) break;
-    _lastBtByteMs = millis();
+    uint32_t now = millis();
+    if (_btConnectMs == 0) _btConnectMs = now;
+    _lastBtByteMs = now;
     if (c == '\n' || c == '\r') {
       if (_btLine.len > 0) {
         _btLine.buf[_btLine.len] = 0;

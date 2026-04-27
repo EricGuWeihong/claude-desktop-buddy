@@ -668,7 +668,9 @@ void drawInfo() {
 
     LinkTransport active = dataLinkTransport();
     bool daemonActive = dataDaemonMs() && (millis() - dataDaemonMs()) <= 30000;
-    uint32_t connSec = daemonActive ? (millis() - dataDaemonMs()) / 1000 : 0;
+    // Uptime tracks from the FIRST heartbeat, not the latest one.
+    uint32_t connectMs = daemonActive ? dataDaemonConnectMs() : 0;
+    uint32_t connSec = connectMs ? (millis() - connectMs) / 1000 : 0;
     uint32_t connMin = connSec / 60;
     uint32_t connHour = connMin / 60;
 
@@ -726,16 +728,18 @@ void drawInfo() {
     y += 12;
 
     // Row 3: Connection duration
-    if (daemonActive || active == LINK_BLE) {
-      uint32_t totalSec = 0;
-      if (daemonActive) totalSec = connSec;
-      else if (active == LINK_BLE && dataBtActive()) totalSec = (millis() - dataBtByteMs()) / 1000;
+    if (daemonActive || (active == LINK_BLE && dataBtActive())) {
+      uint32_t btConnSec = 0;
+      if (daemonActive) btConnSec = connSec;
+      else if (dataBtConnectMs()) btConnSec = (millis() - dataBtConnectMs()) / 1000;
 
-      if (totalSec > 0) {
+      if (btConnSec > 0) {
+        uint32_t btMin = btConnSec / 60;
+        uint32_t btHour = btMin / 60;
         spr->setTextColor(p.textDim, p.bg);
         spr->setCursor(4, y);
-        if (connHour > 0) spr->printf("uptime  %luh %lum", (unsigned long)connHour, (unsigned long)(connMin % 60));
-        else              spr->printf("uptime  %lum %lus", (unsigned long)connMin, (unsigned long)(connSec % 60));
+        if (btHour > 0) spr->printf("uptime  %luh %lum", (unsigned long)btHour, (unsigned long)(btMin % 60));
+        else            spr->printf("uptime  %lum %lus", (unsigned long)btMin, (unsigned long)(btConnSec % 60));
         y += 12;
       }
     }
