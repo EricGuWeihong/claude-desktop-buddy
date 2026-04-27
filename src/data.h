@@ -224,7 +224,8 @@ inline void dataPoll(TamaState* out) {
     // CLI daemon heartbeat keeps the link alive even when hooks aren't firing
     // (e.g. idle between tool calls). Keep session state from last hook.
     if (_lastDaemonMs != 0 && (millis() - _lastDaemonMs) <= 30000) {
-      strncpy(out->msg, "CLI CC via USB", sizeof(out->msg)-1);
+      const char* via = dataBtActive() ? "CLI CC via BT" : "CLI CC via USB";
+      strncpy(out->msg, via, sizeof(out->msg)-1);
       out->msg[sizeof(out->msg)-1]=0;
     } else {
       out->sessionsTotal=0; out->sessionsRunning=0; out->sessionsWaiting=0;
