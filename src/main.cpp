@@ -664,39 +664,49 @@ void drawInfo() {
     ln("  temp     %dC", (int)temp);
 
   } else if (infoPage == 4) {
-    _infoHeader(p, y, "BLUETOOTH", infoPage);
-    bool linked = settings().bt && dataBtActive();
+    _infoHeader(p, y, "TRANSPORT", infoPage);
 
-    spr->setTextColor(linked ? GREEN : (settings().bt ? HOT : p.textDim), p.bg);
+    LinkTransport active = dataLinkTransport();
+
+    // BLE status
+    bool btActive = settings().bt && dataBtActive();
+    spr->setTextColor(active == LINK_BLE ? GREEN : p.textDim, p.bg);
     spr->setTextSize(2);
     spr->setCursor(4, y);
-    spr->print(linked ? "linked" : (settings().bt ? "discover" : "off"));
+    spr->print(active == LINK_BLE ? "BT *" : "BT");
     spr->setTextSize(1);
+    spr->setTextColor(active == LINK_BLE ? GREEN : p.textDim, p.bg);
+    spr->setCursor(60, y + 4);
+    if (active == LINK_BLE) {
+      spr->print(_lastDaemonMs && (millis() - _lastDaemonMs) <= 30000 ? "CLI" : "Desktop");
+    } else {
+      spr->print(btActive ? "active" : (settings().bt ? "discover" : "off"));
+    }
     y += 20;
 
-    spr->setTextColor(p.textDim, p.bg);
-    spr->setTextColor(p.text, p.bg);
-    ln("  %s", btName);
-    spr->setTextColor(p.textDim, p.bg);
-    uint8_t mac[6] = {0};
-    esp_read_mac(mac, ESP_MAC_BT);
-    ln("  %02X:%02X:%02X:%02X:%02X:%02X",
-       mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
-    y += 8;
+    // USB status
+    bool usbActive = active == LINK_USB;
+    spr->setTextColor(usbActive ? GREEN : p.textDim, p.bg);
+    spr->setTextSize(2);
+    spr->setCursor(4, y);
+    spr->print(usbActive ? "USB *" : "USB");
+    spr->setTextSize(1);
+    spr->setTextColor(usbActive ? GREEN : p.textDim, p.bg);
+    spr->setCursor(60, y + 4);
+    spr->print(usbActive ? "CLI" : (_lastDaemonMs && (millis() - _lastDaemonMs) <= 30000 ? "idle" : "off"));
+    y += 20;
 
-    if (linked) {
-      uint32_t age = (millis() - tama.lastUpdated) / 1000;
-      ln("  last msg  %lus", (unsigned long)age);
-    } else if (settings().bt) {
-      spr->setTextColor(p.text, p.bg);
-      ln("TO PAIR");
-      spr->setTextColor(p.textDim, p.bg);
-      ln(" Open Claude desktop");
-      ln(" > Developer");
-      ln(" > Hardware Buddy");
-      y += 4;
-      ln(" auto-connects via BLE");
-    }
+    // WiFi status (placeholder — stack not linked yet)
+    bool wifiActive = active == LINK_WIFI;
+    spr->setTextColor(wifiActive ? GREEN : p.textDim, p.bg);
+    spr->setTextSize(2);
+    spr->setCursor(4, y);
+    spr->print(wifiActive ? "WiFi *" : "WiFi");
+    spr->setTextSize(1);
+    spr->setTextColor(wifiActive ? GREEN : p.textDim, p.bg);
+    spr->setCursor(60, y + 4);
+    spr->print(wifiActive ? "CLI" : "off");
+    y += 20;
 
   } else {
     _infoHeader(p, y, "CREDITS", infoPage);
