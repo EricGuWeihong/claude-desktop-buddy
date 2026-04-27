@@ -18,7 +18,7 @@ struct Stats {
   uint16_t velocity[8];      // ring buffer: seconds-to-respond per approval
   uint8_t  velIdx;
   uint8_t  velCount;
-  uint8_t  level;
+  uint32_t level;           // max 4.29B levels; tokens cap is ~85K levels
   uint32_t tokens;          // cumulative output tokens, drives level
 };
 
@@ -33,7 +33,12 @@ inline void statsLoad() {
   _stats.denials    = _prefs.getUShort("deny", 0);
   _stats.velIdx     = _prefs.getUChar("vidx", 0);
   _stats.velCount   = _prefs.getUChar("vcnt", 0);
-  _stats.level      = _prefs.getUChar("lvl", 0);
+  // Migrate from old uint8_t "lvl" to uint32_t — getUInt returns default 0
+  // for keys stored as UChar, so fall back to getUChar if tokens are 0.
+  _stats.level      = _prefs.getUInt("lvl", 0);
+  if (_stats.level == 0 && _stats.tokens == 0) {
+    _stats.level = _prefs.getUChar("lvl", 0);
+  }
   _stats.tokens     = _prefs.getUInt("tok", 0);
   size_t got = _prefs.getBytes("vel", _stats.velocity, sizeof(_stats.velocity));
   if (got != sizeof(_stats.velocity)) memset(_stats.velocity, 0, sizeof(_stats.velocity));
@@ -53,7 +58,7 @@ inline void statsSave() {
   _prefs.putUShort("deny", _stats.denials);
   _prefs.putUChar("vidx", _stats.velIdx);
   _prefs.putUChar("vcnt", _stats.velCount);
-  _prefs.putUChar("lvl", _stats.level);
+  _prefs.putUInt("lvl", _stats.level);
   _prefs.putUInt("tok", _stats.tokens);
   _prefs.putBytes("vel", _stats.velocity, sizeof(_stats.velocity));
   _prefs.end();
@@ -94,9 +99,9 @@ inline void statsOnBridgeTokens(uint32_t bridgeTotal) {
   _lastBridgeTokens = bridgeTotal;
   if (delta == 0) return;
 
-  uint8_t lvlBefore = (uint8_t)(_stats.tokens / TOKENS_PER_LEVEL);
+  uint32_t lvlBefore = _stats.tokens / TOKENS_PER_LEVEL;
   _stats.tokens += delta;
-  uint8_t lvlAfter = (uint8_t)(_stats.tokens / TOKENS_PER_LEVEL);
+  uint32_t lvlAfter = _stats.tokens / TOKENS_PER_LEVEL;
 
   // Heartbeats are timer-driven telemetry — don't wear NVS on every delta.
   // Tokens accumulate in RAM, persist only on the milestone. Worst case on
