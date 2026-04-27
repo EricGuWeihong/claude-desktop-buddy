@@ -152,7 +152,81 @@ def _update_total(state, transcript_path, transcript_total):
     return state["total_counted"]
 
 
-def _build_payload(evt, total_out, state):
+def _last_tool_use(transcript_path):
+    """Read the transcript and return the most recent tool_use block.
+
+    Returns (tool_name, hint_str) where hint_str is a concise, display-ready
+    summary of the tool input (e.g. the bash command, file path, etc.).
+
+    Scans the full transcript (not incremental) because approval context is
+    only useful for the *last* tool_use, not for earlier ones.
+    """
+    if not transcript_path:
+        return None, None
+
+    last_name = None
+    last_input = None
+
+    try:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    continue
+
+                role = msg.get("message", {}).get("role")
+
+                # Format A: tool_use content blocks.
+                if role == "assistant":
+                    content = (msg.get("message") or {}).get("content")
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "tool_use":
+                                last_name = block.get("name")
+                                last_input = block.get("input")
+
+                # Format B: openai-style tool_calls array.
+                tool_calls = (msg.get("message") or {}).get("tool_calls")
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        last_name = tc.get("function", {}).get("name")
+                        raw = tc.get("function", {}).get("arguments", "{}")
+                        try:
+                            last_input = json.loads(raw) if isinstance(raw, str) else raw
+                        except Exception:
+                            last_input = raw
+    except Exception:
+        pass
+
+    if not last_name:
+        return None, None
+
+    # Build a concise hint from the tool input.
+    hint = _tool_hint(last_name, last_input)
+    return last_name, hint
+
+
+def _tool_hint(tool_name, tool_input):
+    """Create a short, display-friendly hint from a tool's input dict."""
+    if not isinstance(tool_input, dict):
+        s = str(tool_input or "")[:100]
+        return s if len(s) <= 43 else s[:40] + "..."
+
+    # Known keys that make good one-line hints.
+    for key in ("command", "file_path", "path"):
+        if key in tool_input:
+            return str(tool_input[key])[:43]
+
+    # Generic: first value or JSON for small dicts.
+    first = next(iter(tool_input.values()), "")
+    if isinstance(first, str) and len(first) <= 43:
+        return first
+    s = json.dumps(tool_input, separators=(",", ":"))
+    return s if len(s) <= 43 else s[:40] + "..."
+
+
+def _build_payload(evt, total_out, state, transcript_path=""):
     """Shape a firmware-compatible JSON based on the hook event.
 
     Only Notification, PreToolUse, and Stop hooks are relevant —
@@ -166,10 +240,18 @@ def _build_payload(evt, total_out, state):
     ap = state.get("active_prompt")
 
     if event == "Notification":
+        # Notification hook doesn't include tool_name or tool_input — scan
+        # the transcript to find the most recent tool_use block that triggered
+        # this approval. Fall back to "claude-code" / "Claude Code" if not found.
+        name, hint = _last_tool_use(transcript_path)
+        if not name:
+            name = "claude-code"
+        if not hint:
+            hint = "Claude Code"
         ap = {
             "id":   (evt.get("session_id", "cli") or "cli")[:39],
-            "tool": (evt.get("tool_name", "claude-code") or "cli")[:19],
-            "hint": "Claude Code",
+            "tool": name[:19],
+            "hint": hint[:43],
         }
         state["active_prompt"] = ap
         payload.update({
@@ -309,7 +391,7 @@ def main():
     transcript_total = _sum_output_tokens(transcript)
     total_counted = _update_total(state, transcript, transcript_total)
     # _build_payload mutates state["active_prompt"]; save after.
-    payload = _build_payload(evt, total_counted, state)
+    payload = _build_payload(evt, total_counted, state, transcript)
     _save_state(state)
 
     # Record the tmux session we're running in — the daemon reads this
