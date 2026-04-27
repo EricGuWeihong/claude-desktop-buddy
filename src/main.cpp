@@ -667,47 +667,86 @@ void drawInfo() {
     _infoHeader(p, y, "TRANSPORT", infoPage);
 
     LinkTransport active = dataLinkTransport();
-    bool daemonActive = _lastDaemonMs && (millis() - _lastDaemonMs) <= 30000;
+    bool daemonActive = dataDaemonMs() && (millis() - dataDaemonMs()) <= 30000;
+    uint32_t connSec = daemonActive ? (millis() - dataDaemonMs()) / 1000 : 0;
+    uint32_t connMin = connSec / 60;
+    uint32_t connHour = connMin / 60;
 
-    // Determine transport name, client, and status color
-    const char* transportName;
-    const char* clientName;
-    uint16_t statusColor;
+    // Determine transport details
+    const char* transportName = "None";
+    const char* clientName = "None";
+    const char* osInfo = "";
+    const char* auxLabel = "";
+    char auxValue[32] = "";
+    uint16_t statusColor = p.textDim;
 
     if (active == LINK_BLE) {
       transportName = "Bluetooth";
       clientName = daemonActive ? "Claude CLI" : "Claude Desktop";
-      // Active + fresh data = green; active but stale = yellow
+      if (daemonActive && dataDaemonOs()[0]) osInfo = dataDaemonOs();
       statusColor = dataBtActive() ? GREEN : YELLOW;
+      snprintf(auxValue, sizeof(auxValue), "%s", btName);
+      auxLabel = "device";
     } else if (active == LINK_USB) {
       transportName = "USB";
       clientName = "Claude CLI";
-      statusColor = (_lastUsbMs && (millis() - _lastUsbMs) <= 30000) ? GREEN : YELLOW;
+      if (dataDaemonOs()[0]) osInfo = dataDaemonOs();
+      statusColor = (dataUsbMs() && (millis() - dataUsbMs()) <= 30000) ? GREEN : YELLOW;
+      snprintf(auxValue, sizeof(auxValue), "%s", dataDaemonPort());
+      auxLabel = "port";
     } else if (active == LINK_WIFI) {
       transportName = "WiFi";
       clientName = "Claude CLI";
-      statusColor = GREEN;  // WiFi stack not linked yet, placeholder
-    } else {
-      transportName = "None";
-      clientName = "None";
-      statusColor = p.textDim;
+      statusColor = GREEN;
+      const char* ssid = wifiSyncSsid();
+      snprintf(auxValue, sizeof(auxValue), "%s", ssid ? ssid : "-");
+      auxLabel = "ssid";
     }
 
-    // Line 1: transport name in yellow
+    // Row 1: Transport name (yellow, size 2)
     spr->setTextColor(YELLOW, p.bg);
     spr->setTextSize(2);
     spr->setCursor(4, y);
     spr->print(transportName);
-    spr->setTextSize(1);
-    y += 24;
+    y += 18;
 
-    // Line 2: client name with status color
+    // Separator line
+    spr->drawFastHLine(4, y, W - 8, p.textDim);
+    y += 6;
+
+    // Row 2: Client + OS
     spr->setTextColor(statusColor, p.bg);
-    spr->setTextSize(2);
+    spr->setTextSize(1);
     spr->setCursor(4, y);
     spr->print(clientName);
-    spr->setTextSize(1);
-    y += 20;
+    if (osInfo[0]) {
+      spr->setTextColor(p.textDim, p.bg);
+      spr->printf("  %s", osInfo);
+    }
+    y += 12;
+
+    // Row 3: Connection duration
+    if (daemonActive || active == LINK_BLE) {
+      uint32_t totalSec = 0;
+      if (daemonActive) totalSec = connSec;
+      else if (active == LINK_BLE && dataBtActive()) totalSec = (millis() - dataBtByteMs()) / 1000;
+
+      if (totalSec > 0) {
+        spr->setTextColor(p.textDim, p.bg);
+        spr->setCursor(4, y);
+        if (connHour > 0) spr->printf("uptime  %luh %lum", (unsigned long)connHour, (unsigned long)(connMin % 60));
+        else              spr->printf("uptime  %lum %lus", (unsigned long)connMin, (unsigned long)(connSec % 60));
+        y += 12;
+      }
+    }
+
+    // Row 4: Auxiliary info (device name / port / ssid)
+    if (auxLabel[0] && auxValue[0]) {
+      spr->setTextColor(p.textDim, p.bg);
+      spr->setCursor(4, y);
+      spr->printf("%s   %s", auxLabel, auxValue);
+      y += 12;
+    }
 
   } else {
     _infoHeader(p, y, "CREDITS", infoPage);

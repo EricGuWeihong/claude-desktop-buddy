@@ -34,7 +34,17 @@ static uint32_t _lastLiveMs = 0;
 static uint32_t _lastBtByteMs = 0;   // hasClient() lies; track actual BT traffic
 static uint32_t _lastDaemonMs = 0;   // heartbeat from CLI daemon
 static uint32_t _lastUsbMs = 0;      // last USB data (hooks + heartbeat)
+static char     _daemonOs[12] = "";   // "macOS", "Windows", "Linux"
+static char     _daemonPort[20] = ""; // e.g. "/dev/cu.usbmodem1101"
 static bool     _demoMode   = false;
+
+// Accessors for main.cpp to read daemon metadata (static vars aren't shared
+// across translation units).
+inline uint32_t dataDaemonMs()    { return _lastDaemonMs; }
+inline const char* dataDaemonOs() { return _daemonOs; }
+inline const char* dataDaemonPort() { return _daemonPort; }
+inline uint32_t dataBtByteMs()    { return _lastBtByteMs; }
+inline uint32_t dataUsbMs()       { return _lastUsbMs; }
 static uint8_t  _demoIdx    = 0;
 static uint32_t _demoNext   = 0;
 
@@ -126,6 +136,11 @@ static void _applyJson(const char* line, TamaState* out) {
     if (tr && strcmp(tr, "bt") == 0) _lastBtByteMs = millis();
     else if (tr && strcmp(tr, "wifi") == 0) {} // WiFi tracked separately
     else _lastUsbMs = millis();
+    // Capture OS and port for display on TRANSPORT info page.
+    const char* os = doc["os"];
+    if (os) { strncpy(_daemonOs, os, sizeof(_daemonOs)-1); _daemonOs[sizeof(_daemonOs)-1]=0; }
+    const char* port = doc["port"];
+    if (port) { strncpy(_daemonPort, port, sizeof(_daemonPort)-1); _daemonPort[sizeof(_daemonPort)-1]=0; }
     return;
   }
   if (doc["reset"].is<unsigned int>()) {

@@ -181,3 +181,7 @@ inline const char* wifiSyncStateName() {
   }
   return "?";
 }
+
+inline const char* wifiSyncSsid() {
+  return _wssHasCreds ? _wssSsid.c_str() : nullptr;
+}

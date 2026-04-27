@@ -348,7 +348,14 @@ def main():
         now = time.time()
         if now - last_heartbeat >= 10:
             try:
-                ser.write(b'{"daemon":1,"transport":"usb"}\n')
+                plat = sys.platform
+                os_name = "macOS" if plat == "darwin" else ("Windows" if plat == "win32" else "Linux")
+                ser.write(json.dumps({
+                    "daemon": 1,
+                    "transport": "usb",
+                    "os": os_name,
+                    "port": ser.port if hasattr(ser, "port") else "unknown",
+                }).encode() + b"\n")
                 last_heartbeat = now
             except Exception:
                 pass
