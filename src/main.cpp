@@ -667,45 +667,46 @@ void drawInfo() {
     _infoHeader(p, y, "TRANSPORT", infoPage);
 
     LinkTransport active = dataLinkTransport();
+    bool daemonActive = _lastDaemonMs && (millis() - _lastDaemonMs) <= 30000;
 
-    // BLE status
-    bool btActive = settings().bt && dataBtActive();
-    spr->setTextColor(active == LINK_BLE ? GREEN : p.textDim, p.bg);
-    spr->setTextSize(2);
-    spr->setCursor(4, y);
-    spr->print(active == LINK_BLE ? "BT *" : "BT");
-    spr->setTextSize(1);
-    spr->setTextColor(active == LINK_BLE ? GREEN : p.textDim, p.bg);
-    spr->setCursor(60, y + 4);
+    // Determine transport name, client, and status color
+    const char* transportName;
+    const char* clientName;
+    uint16_t statusColor;
+
     if (active == LINK_BLE) {
-      spr->print(_lastDaemonMs && (millis() - _lastDaemonMs) <= 30000 ? "CLI" : "Desktop");
+      transportName = "Bluetooth";
+      clientName = daemonActive ? "Claude CLI" : "Claude Desktop";
+      // Active + fresh data = green; active but stale = yellow
+      statusColor = dataBtActive() ? GREEN : YELLOW;
+    } else if (active == LINK_USB) {
+      transportName = "USB";
+      clientName = "Claude CLI";
+      statusColor = (_lastUsbMs && (millis() - _lastUsbMs) <= 30000) ? GREEN : YELLOW;
+    } else if (active == LINK_WIFI) {
+      transportName = "WiFi";
+      clientName = "Claude CLI";
+      statusColor = GREEN;  // WiFi stack not linked yet, placeholder
     } else {
-      spr->print(btActive ? "active" : (settings().bt ? "discover" : "off"));
+      transportName = "None";
+      clientName = "None";
+      statusColor = p.textDim;
     }
-    y += 20;
 
-    // USB status
-    bool usbActive = active == LINK_USB;
-    spr->setTextColor(usbActive ? GREEN : p.textDim, p.bg);
+    // Line 1: transport name in yellow
+    spr->setTextColor(YELLOW, p.bg);
     spr->setTextSize(2);
     spr->setCursor(4, y);
-    spr->print(usbActive ? "USB *" : "USB");
+    spr->print(transportName);
     spr->setTextSize(1);
-    spr->setTextColor(usbActive ? GREEN : p.textDim, p.bg);
-    spr->setCursor(60, y + 4);
-    spr->print(usbActive ? "CLI" : (_lastDaemonMs && (millis() - _lastDaemonMs) <= 30000 ? "idle" : "off"));
-    y += 20;
+    y += 24;
 
-    // WiFi status (placeholder — stack not linked yet)
-    bool wifiActive = active == LINK_WIFI;
-    spr->setTextColor(wifiActive ? GREEN : p.textDim, p.bg);
+    // Line 2: client name with status color
+    spr->setTextColor(statusColor, p.bg);
     spr->setTextSize(2);
     spr->setCursor(4, y);
-    spr->print(wifiActive ? "WiFi *" : "WiFi");
+    spr->print(clientName);
     spr->setTextSize(1);
-    spr->setTextColor(wifiActive ? GREEN : p.textDim, p.bg);
-    spr->setCursor(60, y + 4);
-    spr->print(wifiActive ? "CLI" : "off");
     y += 20;
 
   } else {
