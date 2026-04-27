@@ -7,9 +7,10 @@ a JSON payload on stdin describing the event; this script:
 
   1. Reads the payload (includes `transcript_path` — the session's JSONL)
   2. Scans the transcript and sums `output_tokens` across all assistant
-     messages. That's the cumulative-since-session-start total, which is
-     exactly what the firmware's statsOnBridgeTokens() expects (it already
-     handles delta + first-sight latch, so sending cumulative is correct).
+     messages, then derives today's running total via a midnight-resetting
+     baseline. We send DAILY (not lifetime cumulative) so cross-source
+     switches (this script vs. another bridge feeding the same firmware)
+     can't spike-credit lifetime totals as a single delta.
   3. Overlays event-specific state (running / waiting / msg / prompt) so
      the pet shows attention during Notification, done at Stop, etc.
   4. Writes one JSON line to /dev/cu.usbmodem* — the firmware's usb serial
@@ -26,18 +27,22 @@ Usage (from settings.json):
 import os
 import sys
 import json
+import datetime
 import subprocess
 
-# Persistent state so we can send a MONOTONICALLY INCREASING cumulative
-# counter across sessions. Two sources feeding the firmware (Desktop's
-# BLE bridge + this USB script) both look like "cumulative from our POV",
-# but they don't share a baseline — the first packet after a source
-# switch gets interpreted as a huge delta, leveling up the pet by 10+
-# levels overnight. Keeping our own running total sidesteps that:
-# - per-transcript we track how many output_tokens we've already counted
-# - `total_counted` is the sum of all deltas ever observed by this tool
-# - we send `total_counted` as "tokens", and the firmware's latch treats
-#   our first packet as a baseline (0 credit), then applies real deltas.
+# Persistent state tracks tokens so the `tokens` field sent to firmware
+# is today's running total (resets at local midnight). Firmware treats
+# the midnight drop as a bridge restart (stats.h bridge-restart branch)
+# and resyncs baseline without crediting — correct: no tokens were
+# actually spent at midnight. Sending DAILY (not cumulative) also bounds
+# cross-source switches: when this script and another bridge feed the
+# same firmware, each machine's daily counter is small enough that a
+# resync-on-drop keeps spurious credit bounded by per-day usage rather
+# than lifetime totals.
+# - per_transcript[path] = last output_tokens count we've added (first
+#   sight latches without crediting historical content)
+# - total_counted = monotonic sum of all deltas; today's slice =
+#   total_counted - today_baseline
 STATE_PATH = os.path.expanduser("~/.claude/buddy_send_state.json")
 
 
@@ -57,9 +62,14 @@ def _load_state():
         s.setdefault("total_counted", 0)
         s.setdefault("per_transcript", {})
         s.setdefault("active_prompt", None)
+        s.setdefault("today_date", None)
+        s.setdefault("today_baseline", 0)
         return s
     except Exception:
-        return {"total_counted": 0, "per_transcript": {}, "active_prompt": None}
+        return {
+            "total_counted": 0, "per_transcript": {}, "active_prompt": None,
+            "today_date": None, "today_baseline": 0,
+        }
 
 
 def _save_state(state):
@@ -137,19 +147,38 @@ _hook_state_for_tokens = None
 def _update_total(state, transcript_path, transcript_total):
     """Advance total_counted by the new output_tokens on this transcript.
 
-    per_transcript[path] remembers the last count we've already added to
-    total_counted. If the transcript shrinks (log rotated, user deleted),
-    we reset that transcript's baseline without subtracting — monotonic.
+    First-sight latch: a transcript_path we've never seen gets its current
+    total recorded as the baseline WITHOUT crediting. This prevents a
+    wiped state file (or a brand-new transcript that already has historical
+    content from a prior run) from spike-crediting the entire history as
+    if it just happened.
     """
-    prev = int(state["per_transcript"].get(transcript_path, 0))
+    per = state["per_transcript"]
+    if transcript_path not in per:
+        per[transcript_path] = transcript_total
+        return state["total_counted"]
+    prev = int(per[transcript_path])
     if transcript_total < prev:
         # Log shrank — re-baseline for this path but keep total monotonic.
-        state["per_transcript"][transcript_path] = transcript_total
+        per[transcript_path] = transcript_total
         return state["total_counted"]
     delta = transcript_total - prev
-    state["per_transcript"][transcript_path] = transcript_total
+    per[transcript_path] = transcript_total
     state["total_counted"] = int(state["total_counted"]) + delta
     return state["total_counted"]
+
+
+def _roll_today(state):
+    """Snapshot today's baseline on local-date change.
+
+    `tokens_today` is derived as total_counted - today_baseline. We snapshot
+    BEFORE applying the current call's delta, so the delta observed on the
+    first hook of a new day correctly counts toward that day.
+    """
+    today = datetime.date.today().isoformat()
+    if state.get("today_date") != today:
+        state["today_baseline"] = int(state.get("total_counted", 0))
+        state["today_date"] = today
 
 
 def _last_tool_use(transcript_path):
@@ -226,14 +255,19 @@ def _tool_hint(tool_name, tool_input):
     return s if len(s) <= 43 else s[:40] + "..."
 
 
-def _build_payload(evt, total_out, state, transcript_path=""):
+def _build_payload(evt, tokens_today, state, transcript_path=""):
     """Shape a firmware-compatible JSON based on the hook event.
 
     Only Notification, PreToolUse, and Stop hooks are relevant —
     auto-approved tools don't trigger Notification but do fire PreToolUse.
+
+    `tokens` carries today's running total, same value as `tokens_today`.
+    Firmware's statsOnBridgeTokens tracks delta-since-last-packet; midnight
+    rollover drops the value to ~0 and hits the bridge-restart branch, which
+    resyncs baseline without credit. No cross-day double counting.
     """
     event = evt.get("hook_event_name", "")
-    payload = {"tokens": total_out, "tokens_today": total_out}
+    payload = {"tokens": tokens_today, "tokens_today": tokens_today}
 
     # Notification fires when approval is needed → set active_prompt.
     # Stop fires when session ends → clear active_prompt.
@@ -389,9 +423,13 @@ def main():
     state = _load_state()
     _hook_state_for_tokens = state  # link for incremental token scanning
     transcript_total = _sum_output_tokens(transcript)
+    # Roll today's baseline BEFORE adding this call's delta, so the delta
+    # at the first hook after midnight is credited to the new day.
+    _roll_today(state)
     total_counted = _update_total(state, transcript, transcript_total)
+    tokens_today = max(0, total_counted - int(state.get("today_baseline", 0)))
     # _build_payload mutates state["active_prompt"]; save after.
-    payload = _build_payload(evt, total_counted, state, transcript)
+    payload = _build_payload(evt, tokens_today, state, transcript)
     _save_state(state)
 
     # Record the tmux session we're running in — the daemon reads this
