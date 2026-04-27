@@ -377,11 +377,10 @@ void characterTick() {
     // possibly starving the BT controller. The sprite already holds the
     // last frame; just stop ticking. Multi-gif states (idle rotation)
     // still advance after a brief pause.
-    if (stateCount[curState] == 1) {
-      gif.close();
-      gifOpen = false;
-      return;
-    }
+    // Single-GIF states: reset and loop continuously.
+    gif.reset();
+    nextFrameAt = now;
+    return;
     // Multi-variant: loop the same GIF until the dwell window elapses, then
     // rotate. Short bufo idles (~0.5s/loop) get ~10 plays instead of one
     // flash + 3s freeze.

@@ -1,7 +1,9 @@
 #pragma once
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <sys/time.h>     // settimeofday / struct timeval (software RTC)
 #include "ble_bridge.h"
+#include "wifi_sync.h"
 #include "xfer.h"
 
 struct TamaState {
@@ -30,6 +32,7 @@ struct TamaState {
 
 static uint32_t _lastLiveMs = 0;
 static uint32_t _lastBtByteMs = 0;   // hasClient() lies; track actual BT traffic
+static uint32_t _lastDaemonMs = 0;   // heartbeat from CLI daemon
 static bool     _demoMode   = false;
 static uint8_t  _demoIdx    = 0;
 static uint32_t _demoNext   = 0;
@@ -64,7 +67,9 @@ inline const char* dataScenarioName() {
 
 // Set true once the bridge sends a time sync — until then the RTC may
 // hold whatever was on the coin cell (or 2000-01-01 if it lost power).
-static bool _rtcValid = false;
+// Non-static so wifi_sync.h can flip it from the NTP path (single-TU
+// header, still resolves in main.cpp).
+bool _rtcValid = false;
 inline bool dataRtcValid() { return _rtcValid; }
 
 static void _applyJson(const char* line, TamaState* out) {
@@ -72,22 +77,55 @@ static void _applyJson(const char* line, TamaState* out) {
   if (deserializeJson(doc, line)) return;
   if (xferCommand(doc)) { _lastLiveMs = millis(); return; }
 
-  // Bridge sends {"time":[epoch_sec, tz_offset_sec]}; gmtime_r on the
-  // adjusted epoch yields local components including weekday.
+  // {"daemon":1} heartbeat from CLI daemon — marks daemon as alive without
+  // triggering any other state change.
+  if (doc["daemon"].is<unsigned int>()) {
+    _lastDaemonMs = millis();
+    return;
+  }
+
+  // {"reset":1} from daemon on startup — clear all stale state.
+  if (doc["reset"].is<unsigned int>()) {
+    out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
+    out->sessionsTotal = 0; out->sessionsRunning = 0; out->sessionsWaiting = 0;
+    out->recentlyCompleted = false; out->lastUpdated = millis();
+    strncpy(out->msg, doc["msg"] ? doc["msg"].as<const char*>() : "ready", sizeof(out->msg)-1);
+    out->msg[sizeof(out->msg)-1] = 0;
+    _lastLiveMs = millis();
+    return;
+  }
+
+  // Bridge sends {"time":[epoch_sec, tz_offset_sec]}. Store real UTC
+  // via settimeofday, apply tz_offset as POSIX TZ env so localtime_r
+  // returns local wall-clock. M5StickS3 has no BM8563 RTC; the ESP32
+  // software RTC is the source of truth.
   JsonArray t = doc["time"];
   if (!t.isNull() && t.size() == 2) {
-    time_t local = (time_t)t[0].as<uint32_t>() + (int32_t)t[1];
-    struct tm lt; gmtime_r(&local, &lt);
-    m5::rtc_time_t tm = { (int8_t)lt.tm_hour, (int8_t)lt.tm_min, (int8_t)lt.tm_sec };
-    m5::rtc_date_t dt = { (int16_t)(lt.tm_year + 1900), (int8_t)(lt.tm_mon + 1),
-                          (int8_t)lt.tm_mday, (int8_t)lt.tm_wday };
-    M5.Rtc.setTime(&tm);
-    M5.Rtc.setDate(&dt);
+    time_t utc = (time_t)t[0].as<uint32_t>();
+    int32_t tz = (int32_t)t[1];
+    struct timeval tv = { .tv_sec = utc, .tv_usec = 0 };
+    settimeofday(&tv, nullptr);
+    _wifiApplyTz(tz);
     extern uint32_t _clkLastRead;
     _clkLastRead = 0;   // force re-read so _clkDt and _rtcValid agree
     _rtcValid = true;
     _lastLiveMs = millis();
     return;
+  }
+
+  // {"wifi":{"ssid":"...","pass":"...","tz":<sec>}} persists credentials
+  // to NVS and kicks off a (re)connect. Subsequent boots sync via NTP
+  // automatically — no Claude Desktop needed for the clock to work.
+  JsonObject w = doc["wifi"];
+  if (!w.isNull()) {
+    const char* ssid = w["ssid"] | "";
+    const char* pass = w["pass"] | "";
+    int32_t tz       = w["tz"]   | 0;
+    if (ssid[0]) {
+      wifiSyncApplyCreds(ssid, pass, tz);
+      _lastLiveMs = millis();
+      return;
+    }
   }
 
   out->sessionsTotal     = doc["total"]     | out->sessionsTotal;
@@ -120,6 +158,13 @@ static void _applyJson(const char* line, TamaState* out) {
     strncpy(out->promptTool, pt  ? pt  : "", sizeof(out->promptTool)-1); out->promptTool[sizeof(out->promptTool)-1]=0;
     strncpy(out->promptHint, ph  ? ph  : "", sizeof(out->promptHint)-1); out->promptHint[sizeof(out->promptHint)-1]=0;
   } else {
+    out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
+  }
+  // {"promptResolving":"<id>"} — CLI resolved a prompt (approved/denied
+  // in terminal or auto-approved). Match by ID so stale prompts disappear
+  // from buddy immediately, without waiting for RESPONSE_TIMEOUT_MS.
+  const char* resolving = doc["promptResolving"];
+  if (resolving && strcmp(resolving, out->promptId) == 0) {
     out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
   }
   out->lastUpdated = millis();
@@ -176,9 +221,16 @@ inline void dataPoll(TamaState* out) {
 
   out->connected = dataConnected();
   if (!out->connected) {
-    out->sessionsTotal=0; out->sessionsRunning=0; out->sessionsWaiting=0;
-    out->recentlyCompleted=false; out->lastUpdated=now;
-    strncpy(out->msg, "No Claude connected", sizeof(out->msg)-1);
-    out->msg[sizeof(out->msg)-1]=0;
+    // CLI daemon heartbeat keeps the link alive even when hooks aren't firing
+    // (e.g. idle between tool calls). Keep session state from last hook.
+    if (_lastDaemonMs != 0 && (millis() - _lastDaemonMs) <= 30000) {
+      strncpy(out->msg, "CLI CC via USB", sizeof(out->msg)-1);
+      out->msg[sizeof(out->msg)-1]=0;
+    } else {
+      out->sessionsTotal=0; out->sessionsRunning=0; out->sessionsWaiting=0;
+      out->recentlyCompleted=false; out->lastUpdated=now;
+      strncpy(out->msg, "No Claude connected", sizeof(out->msg)-1);
+      out->msg[sizeof(out->msg)-1]=0;
+    }
   }
 }

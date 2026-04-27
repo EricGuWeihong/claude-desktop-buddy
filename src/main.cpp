@@ -20,6 +20,7 @@ static void startBt() {
 
 #include "character.h"
 #include "stats.h"
+#include "sound.h"
 const int W = 135, H = 240;
 const int CX = W / 2;
 const int CY_BASE = 120;
@@ -87,13 +88,19 @@ bool     napping = false;
 uint32_t napStartMs = 0;
 uint32_t promptArrivedMs = 0;
 
-// M5StickS3 has no IMU; guard all accel calls.
+// M5StickC S3 has a BMI270 IMU on the internal I2C bus. Earlier revisions
+// of this code used M5.Imu.getTemp() as a probe — BMI270's driver in
+// M5Unified doesn't implement getTemp reliably, so that probe returned
+// non-zero and the whole file concluded "no IMU". getType() reflects what
+// M5.begin() actually detected and is the authoritative answer.
 static bool hasImu() {
-  float t = 0;
-  return M5.Imu.getTemp(&t) == 0;
+  return M5.Imu.getType() != m5::imu_none;
 }
 
-// Face-down = Z-axis dominant and negative. Debounced so a toss doesn't count.
+// Face-down = Z-axis dominant. BMI270 on the S3 reports az ≈ +1.0 when
+// the display faces up, so flipped-down is az ≈ -1.0 (same convention as
+// the MPU6886 on the older StickC). If a future board revision flips this,
+// watch the `[imu]` serial line on boot and negate the threshold.
 static bool isFaceDown() {
   if (!hasImu()) return false;
   float ax, ay, az;
@@ -114,16 +121,26 @@ static void wake() {
   if (dimmed) { applyBrightness(); dimmed = false; }
 }
 bool     responseSent = false;
+uint32_t responseSentAtMs = 0;
+const uint32_t RESPONSE_TIMEOUT_MS = 2000;
 
 static void beep(uint16_t freq, uint16_t dur) {
   if (settings().sound) M5.Speaker.tone(freq, dur);
 }
 
+// Send to both BLE bridge and USB serial (Desktop ↔ firmware protocol).
 static void sendCmd(const char* json) {
   Serial.println(json);
   size_t n = strlen(json);
   bleWrite((const uint8_t*)json, n);
   bleWrite((const uint8_t*)"\n", 1);
+}
+
+// Send only over USB serial — used for approval responses that the Mac
+// daemon reads and forwards to Claude Code via tmux. BLE Desktop already
+// handles {"cmd":"permission"} so don't echo it back over BLE.
+static void sendSerial(const char* json) {
+  Serial.println(json);
 }
 const uint8_t INFO_PAGES = 6;
 const uint8_t INFO_PG_BUTTONS = 1;
@@ -364,8 +381,18 @@ static void clockRefreshRtc() {
   if (millis() - _clkLastRead < 1000) return;
   _clkLastRead = millis();
   _onUsb = (M5.Power.isCharging() != m5::Power_Class::is_discharging);
-  M5.Rtc.getTime(&_clkTm);
-  M5.Rtc.getDate(&_clkDt);
+  // Read ESP32 software RTC. Populated by either data.h's {"time":...}
+  // handler (BLE path) or wifi_sync's NTP flow. TZ env var set alongside,
+  // so localtime_r returns local wall-clock regardless of source.
+  time_t now = time(nullptr);
+  struct tm lt; localtime_r(&now, &lt);
+  _clkTm.hours   = (int8_t)lt.tm_hour;
+  _clkTm.minutes = (int8_t)lt.tm_min;
+  _clkTm.seconds = (int8_t)lt.tm_sec;
+  _clkDt.weekDay = (int8_t)lt.tm_wday;
+  _clkDt.month   = (int8_t)(lt.tm_mon + 1);
+  _clkDt.date    = (int8_t)lt.tm_mday;
+  _clkDt.year    = (int16_t)(lt.tm_year + 1900);
 }
 
 static void clockUpdateOrient() {
@@ -943,10 +970,28 @@ void drawHUD() {
 }
 
 void setup() {
+  // M5StickS3 HOLD pin (G46): the M5PM1 PMIC cuts VBUS when the power
+  // button is pressed unless this pin is held high by firmware. Latch
+  // it on before anything else — M5Unified does this in M5.begin() for
+  // detected boards, but belt-and-suspenders avoids a reset race if
+  // board detection hiccups.
+  pinMode(46, OUTPUT);
+  digitalWrite(46, HIGH);
+
   auto cfg = M5.config();
   M5.begin(cfg);
+  M5.Speaker.setVolume(200);  // 0-255, boost from default
   Serial.begin(115200);
-  Serial.println("[setup] M5.begin ok");
+  Serial.printf("[setup] M5.begin ok, board=%d\n", (int)M5.getBoard());
+  {
+    // One-shot IMU diagnostic — confirms BMI270 is detected and shows the
+    // axis orientation at boot. If you see accel=(0,0,~+1) the display is
+    // up and isFaceDown's az<-0.7 check is correctly polarised.
+    int t = (int)M5.Imu.getType();
+    float ax = 0, ay = 0, az = 0;
+    M5.Imu.getAccelData(&ax, &ay, &az);
+    Serial.printf("[imu] type=%d accel=(%.2f, %.2f, %.2f)\n", t, ax, ay, az);
+  }
   startBt();
   Serial.println("[setup] BT started");
   pinMode(LED_PIN, OUTPUT);
@@ -992,16 +1037,22 @@ void setup() {
   }
 
   Serial.printf("buddy: %s\n", buddyMode ? "ASCII mode" : "GIF character loaded");
+
+  // WiFi + NTP: no-op if no creds stored. Safe to call after BLE init;
+  // the two radios coexist on S3 with WiFi modem sleep enabled.
+  wifiSyncInit();
 }
 
 void loop() {
   M5.update();
-  
+
   t++;
   uint32_t now = millis();
 
   dataPoll(&tama);
-  if (statsPollLevelUp()) triggerOneShot(P_CELEBRATE, 3000);
+  wifiSyncPoll();
+  soundTick();
+  if (statsPollLevelUp()) { playLevelUp(); triggerOneShot(P_CELEBRATE, 3000); }
   baseState = derive(tama);
 
   // After waking the screen, hold sleep for 12s so users see the wake-up
@@ -1023,6 +1074,7 @@ void loop() {
     if (!menuOpen && !screenOff && checkShake() && (int32_t)(now - oneShotUntil) >= 0) {
       wake();
       triggerOneShot(P_DIZZY, 2000);
+      playHappyCry();       // Happy cry on shake
       Serial.println("shake: dizzy");
     }
   }
@@ -1033,10 +1085,11 @@ void loop() {
     strncpy(lastPromptId, tama.promptId, sizeof(lastPromptId)-1);
     lastPromptId[sizeof(lastPromptId)-1] = 0;
     responseSent = false;
+    responseSentAtMs = 0;
     if (tama.promptId[0]) {
       promptArrivedMs = millis();
       wake();
-      beep(1200, 80);   // alert chirp
+      playNotify();         // Notification sound on prompt arrival
       // Jump to the approval screen no matter what was open — drawApproval
       // only runs from drawHUD which only runs in DISP_NORMAL.
       displayMode = DISP_NORMAL;
@@ -1045,6 +1098,14 @@ void loop() {
       characterInvalidate();
       if (buddyMode) buddyInvalidate();
     }
+  }
+
+  // After sending an approval/denial, show "sent..." briefly then clear
+  // so the buddy returns to idle even if no new hook fires (auto-approved
+  // tools don't trigger Notification, so the prompt can otherwise stick).
+  if (responseSent && millis() - responseSentAtMs >= RESPONSE_TIMEOUT_MS) {
+    responseSent = false;
+    tama.promptId[0] = 0;
   }
 
   bool inPrompt = tama.promptId[0] && !responseSent;
@@ -1089,7 +1150,13 @@ void loop() {
         char cmd[96];
         snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"once\"}", tama.promptId);
         sendCmd(cmd);
+        // Mirror a simple response over USB-only so the Mac daemon can
+        // forward it to Claude Code via tmux.
+        char resp[96];
+        snprintf(resp, sizeof(resp), "{\"approval\":\"yes\",\"id\":\"%s\"}", tama.promptId);
+        sendSerial(resp);
         responseSent = true;
+        responseSentAtMs = millis();
         uint32_t tookS = (millis() - promptArrivedMs) / 1000;
         statsOnApproval(tookS);
         beep(2400, 60);
@@ -1122,7 +1189,13 @@ void loop() {
       char cmd[96];
       snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
       sendCmd(cmd);
+      // Mirror a simple response over USB-only so the Mac daemon can
+      // forward it to Claude Code via tmux.
+      char resp[96];
+      snprintf(resp, sizeof(resp), "{\"approval\":\"no\",\"id\":\"%s\"}", tama.promptId);
+      sendSerial(resp);
       responseSent = true;
+      responseSentAtMs = millis();
       statsOnDenial();
       beep(600, 60);
     } else if (resetOpen) {
@@ -1142,8 +1215,9 @@ void loop() {
       petPage = (petPage + 1) % PET_PAGES;
       applyDisplayMode();
     } else {
-      beep(2400, 30);
-      msgScroll = (msgScroll >= 30) ? 0 : msgScroll + 1;
+      // pet: heart + happy cry
+      triggerOneShot(P_HEART, 2000);
+      playHappyCry();
     }
   }
 
@@ -1175,6 +1249,9 @@ void loop() {
     wasLandscape = landscapeClock;
   }
   if (clocking) {
+    // Respect one-shot animations — don't overwrite them with idle states.
+    if ((int32_t)(now - oneShotUntil) < 0) { /* one-shot active, skip clock state */ }
+    else {
     uint8_t dow = clockDow();
     bool weekend = (dow == 0 || dow == 6);
     bool friday  = (dow == 5);
@@ -1187,6 +1264,7 @@ void loop() {
     else if (friday && h >= 15)      activeState = (now/4000 % 3 == 0) ? P_CELEBRATE : P_IDLE;
     else if (h >= 22 || h == 0)      activeState = (now/7000 % 3 == 0) ? P_DIZZY : P_SLEEP;
     else                             activeState = (now/10000 % 5 == 0) ? P_SLEEP : P_IDLE;
+    }
   }
 
   static uint32_t lastPasskey = 0;

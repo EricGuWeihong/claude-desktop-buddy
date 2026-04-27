@@ -1,0 +1,19 @@
+{
+  "name": "dragonite",
+  "colors": {
+    "body": "#EEB44A",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "textDim": "#808080",
+    "ink": "#000000"
+  },
+  "states": {
+    "sleep": "sleep.gif",
+    "idle": "idle.gif",
+    "busy": "busy.gif",
+    "attention": "attention.gif",
+    "celebrate": "celebrate.gif",
+    "dizzy": "dizzy.gif",
+    "heart": "heart.gif"
+  }
+}
