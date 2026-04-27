@@ -33,6 +33,7 @@ struct TamaState {
 static uint32_t _lastLiveMs = 0;
 static uint32_t _lastBtByteMs = 0;   // hasClient() lies; track actual BT traffic
 static uint32_t _lastDaemonMs = 0;   // heartbeat from CLI daemon
+static uint32_t _lastUsbMs = 0;      // last USB data (hooks + heartbeat)
 static bool     _demoMode   = false;
 static uint8_t  _demoIdx    = 0;
 static uint32_t _demoNext   = 0;
@@ -65,6 +66,43 @@ inline const char* dataScenarioName() {
   return "none";
 }
 
+// Active link info — picks the most recently active transport, prioritizing
+// the daemon heartbeat (CLI signal) over raw data freshness. This prevents
+// Desktop BLE heartbeats from masking an active USB daemon connection.
+enum LinkTransport { LINK_NONE, LINK_USB, LINK_BLE, LINK_WIFI };
+
+inline LinkTransport dataLinkTransport() {
+  if (_demoMode) return LINK_NONE;
+  // Daemon heartbeat is the authoritative CLI signal — if seen recently,
+  // the transport from the heartbeat wins (with BLE override when BT data
+  // is even fresher).
+  if (_lastDaemonMs != 0 && (millis() - _lastDaemonMs) <= 30000) {
+    // If BT data is fresher than USB, CLI is likely via BT (Win/BT daemon)
+    bool btFresher = (_lastBtByteMs >= _lastUsbMs);
+    return btFresher ? LINK_BLE : LINK_USB;
+  }
+  // No daemon heartbeat — pick whichever transport has fresher data.
+  // Without daemon signal, this could be Desktop BLE or a freshly started
+  // USB daemon whose first heartbeat hasn't arrived yet.
+  bool btFresher = (_lastBtByteMs >= _lastUsbMs);
+  return btFresher ? LINK_BLE : LINK_NONE;
+}
+
+inline const char* dataLinkInfo() {
+  LinkTransport t = dataLinkTransport();
+  if (t == LINK_BLE) {
+    // Could be Desktop BLE or CLI via BLE — we can't distinguish from
+    // data alone; Desktop doesn't send a daemon heartbeat.
+    if (_lastDaemonMs != 0 && (millis() - _lastDaemonMs) <= 30000) {
+      return "CLI via BT";
+    }
+    return "Desktop via BT";
+  }
+  if (t == LINK_USB) return "CLI via USB";
+  if (t == LINK_WIFI) return "CLI via WiFi";
+  return "none";
+}
+
 // Set true once the bridge sends a time sync — until then the RTC may
 // hold whatever was on the coin cell (or 2000-01-01 if it lost power).
 // Non-static so wifi_sync.h can flip it from the NTP path (single-TU
@@ -78,13 +116,18 @@ static void _applyJson(const char* line, TamaState* out) {
   if (xferCommand(doc)) { _lastLiveMs = millis(); return; }
 
   // {"daemon":1} heartbeat from CLI daemon — marks daemon as alive without
-  // triggering any other state change.
+  // triggering any other state change. Includes "transport" to identify the
+  // link medium (usb/bt/wifi).
   if (doc["daemon"].is<unsigned int>()) {
     _lastDaemonMs = millis();
+    // Track transport from heartbeat so we know which link the CLI daemon
+    // is using. Default to USB for legacy daemons that don't send it.
+    const char* tr = doc["transport"];
+    if (tr && strcmp(tr, "bt") == 0) _lastBtByteMs = millis();
+    else if (tr && strcmp(tr, "wifi") == 0) {} // WiFi tracked separately
+    else _lastUsbMs = millis();
     return;
   }
-
-  // {"reset":1} from daemon on startup — clear all stale state.
   if (doc["reset"].is<unsigned int>()) {
     out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
     out->sessionsTotal = 0; out->sessionsRunning = 0; out->sessionsWaiting = 0;
@@ -202,7 +245,13 @@ inline void dataPoll(TamaState* out) {
     return;
   }
 
-  _usbLine.feed(Serial, out);
+  // Feed USB serial data into the line buffer — any parsed JSON line
+  // (including daemon heartbeat) has already updated _lastUsbMs inside
+  // _applyJson, so we just mark USB as active when Serial has data.
+  if (Serial.available()) {
+    _lastUsbMs = millis();
+    _usbLine.feed(Serial, out);
+  }
   // BLE ring buffer is drained manually since it's not a Stream.
   while (bleAvailable()) {
     int c = bleRead();
@@ -224,8 +273,7 @@ inline void dataPoll(TamaState* out) {
     // CLI daemon heartbeat keeps the link alive even when hooks aren't firing
     // (e.g. idle between tool calls). Keep session state from last hook.
     if (_lastDaemonMs != 0 && (millis() - _lastDaemonMs) <= 30000) {
-      const char* via = dataBtActive() ? "CLI CC via BT" : "CLI CC via USB";
-      strncpy(out->msg, via, sizeof(out->msg)-1);
+      strncpy(out->msg, dataLinkInfo(), sizeof(out->msg)-1);
       out->msg[sizeof(out->msg)-1]=0;
     } else {
       out->sessionsTotal=0; out->sessionsRunning=0; out->sessionsWaiting=0;

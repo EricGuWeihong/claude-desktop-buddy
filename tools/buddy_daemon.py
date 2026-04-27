@@ -348,7 +348,7 @@ def main():
         now = time.time()
         if now - last_heartbeat >= 10:
             try:
-                ser.write(b'{"daemon":1}\n')
+                ser.write(b'{"daemon":1,"transport":"usb"}\n')
                 last_heartbeat = now
             except Exception:
                 pass

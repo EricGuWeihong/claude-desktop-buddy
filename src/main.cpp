@@ -620,7 +620,7 @@ void drawInfo() {
     spr->setTextColor(p.text, p.bg);
     ln("LINK");
     spr->setTextColor(p.textDim, p.bg);
-    ln("  via       %s", dataScenarioName());
+    ln("  via       %s", dataLinkInfo());
     ln("  ble       %s", !bleConnected() ? "-" : bleSecure() ? "encrypted" : "OPEN");
     uint32_t age = (millis() - tama.lastUpdated) / 1000;
     ln("  last msg  %lus", (unsigned long)age);
