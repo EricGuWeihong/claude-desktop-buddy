@@ -222,3 +222,46 @@ nothing you'd mind overwritten.
 The BLE API is only available when the desktop apps are in developer mode
 (**Help → Troubleshooting → Enable Developer Mode**). It's intended for
 makers and developers and isn't an officially supported product feature.
+
+## Voice push-to-talk (CLI daemon)
+
+The CLI daemon (`tools/buddy_daemon.py`) extends the wire protocol with
+five commands that drive a push-to-talk voice-input flow. Hold side
+button B for 2 s to start recording, short-press B to stop and trigger
+ASR, long-press B again while listening to discard and re-record. After
+the host pastes the transcript into the active window, A → Enter and
+B → Cancel (delete the just-pasted text).
+
+Device → host:
+
+```jsonc
+{"cmd":"audio_begin","sr":16000,"bits":16,"ch":1,"codec":"pcm_b64","samples":N}
+{"cmd":"audio_chunk","i":<idx>,"data":"<base64-pcm>"}    // emitted in order
+{"cmd":"audio_end","crc":<u32>}                           // CRC32 of all PCM bytes
+{"cmd":"voice_enter"}    // user pressed A in REVIEW window — press Return
+{"cmd":"voice_cancel"}   // user pressed B in REVIEW window — delete the paste
+```
+
+PCM is signed 16-bit little-endian, mono, 16 kHz. Each chunk is up to
+1 KB raw before base64 (≈1.4 KB after). CRC32 uses the IEEE polynomial
+(zlib-compatible, init 0xFFFFFFFF, final XOR 0xFFFFFFFF).
+
+Host → device:
+
+```jsonc
+{"ack":"voice","ok":true,"text":"<truncated transcript>"}    // paste succeeded
+{"ack":"voice","ok":false,"err":"<reason>"}                  // no paste — back to idle
+```
+
+Daemon environment:
+
+- `BUDDY_ASR_BACKEND` — `mlx` (default) uses local MLX Whisper; `qwen`
+  uses Aliyun DashScope `qwen-asr-flash`.
+- `BUDDY_ASR_MLX_MODEL` — override the MLX repo (default
+  `mlx-community/whisper-large-v3-turbo`).
+- `DASHSCOPE_API_KEY` — required when `BUDDY_ASR_BACKEND=qwen`.
+
+macOS permissions: paste / Enter / cancel-backspace all use
+`osascript`'s `System Events`, so the parent process running the daemon
+(usually `Terminal.app` or `iTerm.app`) must be granted **Accessibility**
+in System Settings → Privacy & Security → Accessibility.

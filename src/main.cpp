@@ -21,6 +21,7 @@ static void startBt() {
 #include "character.h"
 #include "stats.h"
 #include "sound.h"
+#include "voice.h"
 const int W = 135, H = 240;
 const int CX = W / 2;
 const int CY_BASE = 120;
@@ -46,6 +47,7 @@ bool    menuOpen    = false;
 uint8_t menuSel     = 0;
 uint8_t brightLevel = 4;           // 0..4 → ScreenBreath 20..100
 bool    btnALong    = false;
+bool    btnBLong    = false;
 
 enum DisplayMode { DISP_NORMAL, DISP_PET, DISP_INFO, DISP_COUNT };
 uint8_t displayMode = DISP_NORMAL;
@@ -129,7 +131,8 @@ static void beep(uint16_t freq, uint16_t dur) {
 }
 
 // Send to both BLE bridge and USB serial (Desktop ↔ firmware protocol).
-static void sendCmd(const char* json) {
+// Non-static so voice.cpp can reuse the same fan-out.
+void sendCmd(const char* json) {
   Serial.println(json);
   size_t n = strlen(json);
   bleWrite((const uint8_t*)json, n);
@@ -141,6 +144,47 @@ static void sendCmd(const char* json) {
 // handles {"cmd":"permission"} so don't echo it back over BLE.
 static void sendSerial(const char* json) {
   Serial.println(json);
+}
+
+// Voice push-to-talk overlay. Drawn last (over HUD/info/pet) so it's
+// always visible while a voice cycle is active. No-op in VOICE_IDLE.
+static void drawVoiceOverlay() {
+  if (voiceMode == VOICE_IDLE) return;
+  const int panelH = 56;
+  const int y = H - panelH;
+  spr->fillRect(0, y, W, panelH, PANEL);
+  spr->drawFastHLine(0, y, W, HOT);
+  spr->setTextSize(1);
+  spr->setTextDatum(MC_DATUM);
+
+  if (voiceMode == VOICE_LISTENING) {
+    spr->setTextColor(HOT, PANEL);
+    spr->drawString("Listening...", W/2, y + 14);
+    char t[16];
+    snprintf(t, sizeof(t), "%lus / 30s", (unsigned long)(voiceListenMs() / 1000));
+    spr->setTextColor(0xFFFF, PANEL);
+    spr->drawString(t, W/2, y + 30);
+    spr->setTextColor(0xC618, PANEL);
+    spr->drawString("Hold B: redo  /  B: stop", W/2, y + 44);
+  } else if (voiceMode == VOICE_ANALYZING) {
+    spr->setTextColor(HOT, PANEL);
+    spr->drawString("Analyzing...", W/2, y + 18);
+    spr->setTextColor(0xC618, PANEL);
+    spr->drawString("transcribing speech", W/2, y + 36);
+  } else if (voiceMode == VOICE_REVIEW) {
+    spr->setTextColor(0x07E0, PANEL);   // green
+    spr->drawString("Press A -> Enter", W/2, y + 12);
+    spr->setTextColor(HOT, PANEL);
+    spr->drawString("Press B -> Cancel", W/2, y + 26);
+    if (voiceLastText[0]) {
+      spr->setTextColor(0xC618, PANEL);
+      spr->drawString(voiceLastText, W/2, y + 42);
+    }
+  } else if (voiceMode == VOICE_ERROR_FLASH) {
+    spr->setTextColor(HOT, PANEL);
+    spr->drawString("Voice failed", W/2, y + 24);
+  }
+  spr->setTextDatum(TL_DATUM);
 }
 const uint8_t INFO_PAGES = 6;
 const uint8_t INFO_PG_BUTTONS = 1;
@@ -1035,6 +1079,8 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Speaker.setVolume(200);  // 0-255, boost from default
+  Serial.setRxBufferSize(4096);
+  Serial.setTxBufferSize(4096);
   Serial.begin(115200);
   Serial.printf("[setup] M5.begin ok, board=%d\n", (int)M5.getBoard());
   {
@@ -1095,6 +1141,10 @@ void setup() {
   // WiFi + NTP: no-op if no creds stored. Safe to call after BLE init;
   // the two radios coexist on S3 with WiFi modem sleep enabled.
   wifiSyncInit();
+
+  // Pre-allocate the PSRAM voice buffer once so a B-long-press doesn't
+  // pay the 960 KB allocator cost in the press-handler.
+  voiceInit();
 }
 
 void loop() {
@@ -1106,6 +1156,7 @@ void loop() {
   dataPoll(&tama);
   wifiSyncPoll();
   soundTick();
+  voiceTick();
   if (statsPollLevelUp()) { playLevelUp(); triggerOneShot(P_CELEBRATE, 3000); }
   baseState = derive(tama);
 
@@ -1186,6 +1237,26 @@ void loop() {
     }
   }
 
+  // BtnB long-press (2 s): voice push-to-talk.
+  //   IDLE  → start listening (only when no modal/prompt is on screen).
+  //   LISTEN → discard buffer + restart (re-record). Briefly hand the I2S
+  //            bus back to the speaker for the cancel beep, then re-grab
+  //            the mic. Other voice sub-states swallow the long-press.
+  if (M5.BtnB.pressedFor(2000) && !btnBLong && !swallowBtnB) {
+    btnBLong = true;
+    if (voiceMode == VOICE_IDLE
+        && !menuOpen && !settingsOpen && !resetOpen && !inPrompt) {
+      beep(1200, 60);
+      if (!voiceStartListening()) beep(400, 200);   // PSRAM/mic init failed
+    } else if (voiceMode == VOICE_LISTENING) {
+      voiceMicPause();
+      beep(600, 120);
+      delay(140);
+      voiceMicResume();
+      voiceRestartListening();
+    }
+  }
+
   if (M5.BtnA.pressedFor(600) && !btnALong && !swallowBtnA) {
     btnALong = true;
     beep(800, 60);
@@ -1200,7 +1271,15 @@ void loop() {
   }
   if (M5.BtnA.wasReleased()) {
     if (!btnALong && !swallowBtnA) {
-      if (inPrompt) {
+      if (voiceMode == VOICE_REVIEW) {
+        sendCmd("{\"cmd\":\"voice_enter\"}");
+        beep(2400, 60);
+        voiceMode = VOICE_IDLE;
+      } else if (voiceMode == VOICE_LISTENING
+              || voiceMode == VOICE_ANALYZING
+              || voiceMode == VOICE_ERROR_FLASH) {
+        // swallow — voice flow owns A while it runs
+      } else if (inPrompt) {
         char cmd[96];
         snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"once\"}", tama.promptId);
         sendCmd(cmd);
@@ -1235,44 +1314,58 @@ void loop() {
     swallowBtnA = false;
   }
 
-  // BtnB: pet → heart
-  if (M5.BtnB.wasPressed()) {
-    if (swallowBtnB) { swallowBtnB = false; }
-    else
-    if (inPrompt) {
-      char cmd[96];
-      snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
-      sendCmd(cmd);
-      // Mirror a simple response over USB-only so the Mac daemon can
-      // forward it to Claude Code via tmux.
-      char resp[96];
-      snprintf(resp, sizeof(resp), "{\"approval\":\"no\",\"id\":\"%s\"}", tama.promptId);
-      sendSerial(resp);
-      responseSent = true;
-      responseSentAtMs = millis();
-      statsOnDenial();
-      beep(600, 60);
-    } else if (resetOpen) {
-      beep(2400, 30);
-      applyReset(resetSel);
-    } else if (settingsOpen) {
-      beep(2400, 30);
-      applySetting(settingsSel);
-    } else if (menuOpen) {
-      beep(2400, 30);
-      menuConfirm();
-    } else if (displayMode == DISP_INFO) {
-      beep(2400, 30);
-      infoPage = (infoPage + 1) % INFO_PAGES;
-    } else if (displayMode == DISP_PET) {
-      beep(2400, 30);
-      petPage = (petPage + 1) % PET_PAGES;
-      applyDisplayMode();
-    } else {
-      // pet: heart + happy cry
-      triggerOneShot(P_HEART, 2000);
-      playHappyCry();
+  // BtnB: short-press fires on release so it can be distinguished from
+  //   the long-press path above (voice push-to-talk). All previous BtnB
+  //   short-press semantics are preserved on the !btnBLong branch.
+  if (M5.BtnB.wasReleased()) {
+    if (!btnBLong && !swallowBtnB) {
+      if (voiceMode == VOICE_LISTENING) {
+        voiceFinishListening();
+        beep(2000, 80);
+      } else if (voiceMode == VOICE_REVIEW) {
+        sendCmd("{\"cmd\":\"voice_cancel\"}");
+        beep(800, 80);
+        voiceMode = VOICE_IDLE;
+      } else if (voiceMode == VOICE_ANALYZING
+              || voiceMode == VOICE_ERROR_FLASH) {
+        // swallow
+      } else if (inPrompt) {
+        char cmd[96];
+        snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
+        sendCmd(cmd);
+        // Mirror a simple response over USB-only so the Mac daemon can
+        // forward it to Claude Code via tmux.
+        char resp[96];
+        snprintf(resp, sizeof(resp), "{\"approval\":\"no\",\"id\":\"%s\"}", tama.promptId);
+        sendSerial(resp);
+        responseSent = true;
+        responseSentAtMs = millis();
+        statsOnDenial();
+        beep(600, 60);
+      } else if (resetOpen) {
+        beep(2400, 30);
+        applyReset(resetSel);
+      } else if (settingsOpen) {
+        beep(2400, 30);
+        applySetting(settingsSel);
+      } else if (menuOpen) {
+        beep(2400, 30);
+        menuConfirm();
+      } else if (displayMode == DISP_INFO) {
+        beep(2400, 30);
+        infoPage = (infoPage + 1) % INFO_PAGES;
+      } else if (displayMode == DISP_PET) {
+        beep(2400, 30);
+        petPage = (petPage + 1) % PET_PAGES;
+        applyDisplayMode();
+      } else {
+        // pet: heart + happy cry
+        triggerOneShot(P_HEART, 2000);
+        playHappyCry();
+      }
     }
+    btnBLong = false;
+    swallowBtnB = false;
   }
 
   // blink bookkeeping
@@ -1367,6 +1460,7 @@ void loop() {
     if (resetOpen) drawReset();
     else if (settingsOpen) drawSettings();
     else if (menuOpen) drawMenu();
+    drawVoiceOverlay();
     spr->pushSprite(0, 0);
   }
 
@@ -1397,6 +1491,7 @@ void loop() {
   // so now - lastInteractMs underflows when a button is held → flicker.
   // No auto-off on USB power — clock face wants to stay visible while charging.
   if (!screenOff && !inPrompt && !_onUsb
+      && voiceMode == VOICE_IDLE
       && millis() - lastInteractMs > SCREEN_OFF_MS) {
     M5.Display.sleep();
     screenOff = true;

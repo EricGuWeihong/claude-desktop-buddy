@@ -5,6 +5,7 @@
 #include "ble_bridge.h"
 #include "wifi_sync.h"
 #include "xfer.h"
+#include "voice.h"
 
 struct TamaState {
   uint8_t  sessionsTotal;
@@ -129,6 +130,17 @@ static void _applyJson(const char* line, TamaState* out) {
   if (deserializeJson(doc, line)) return;
   if (xferCommand(doc)) { _lastLiveMs = millis(); return; }
 
+  // {"ack":"voice","ok":bool,"text":"..."} — host finished ASR/paste.
+  // Drives the firmware out of VOICE_ANALYZING; voice.cpp owns the state.
+  const char* ackTag = doc["ack"];
+  if (ackTag && strcmp(ackTag, "voice") == 0) {
+    bool ok = doc["ok"] | false;
+    const char* tx = doc["text"] | "";
+    voiceOnAck(ok, tx);
+    _lastLiveMs = millis();
+    return;
+  }
+
   // {"daemon":1} heartbeat from CLI daemon — marks daemon as alive without
   // triggering any other state change. Includes "transport" to identify the
   // link medium (usb/bt/wifi).
@@ -249,7 +261,9 @@ struct _LineBuf {
     while (s.available()) {
       char c = s.read();
       if (c == '\n' || c == '\r') {
-        if (len > 0) { buf[len]=0; if (buf[0]=='{') _applyJson(buf, out); len=0; }
+        if (len > 0) {
+          buf[len]=0; if (buf[0]=='{') _applyJson(buf, out); len=0;
+        }
       } else if (len < N-1) {
         buf[len++] = c;
       }

@@ -22,6 +22,7 @@ Runs until Ctrl-C. Silently reconnects if the M5Stick is unplugged and
 plugged back in.
 """
 import argparse
+import base64
 import fcntl
 import glob
 import json
@@ -29,10 +30,63 @@ import os
 import select
 import subprocess
 import sys
+import threading
 import time
+
+# Single lock guarding ALL writes to the device serial port. Without this,
+# the heartbeat timer (main thread), FIFO forwarder (main thread), and the
+# voice ACK writer (transcribe sub-thread) can interleave bytes mid-message,
+# corrupting JSON lines on the device. That manifested as the buddy hanging
+# in ANALYZING until the ack timeout because the corrupted ack failed to
+# parse and voiceOnAck was never called.
+_ser_write_lock = threading.Lock()
+
+
+def ser_write(ser, data):
+    if ser is None:
+        return
+    with _ser_write_lock:
+        ser.write(data)
+
+# Load .env from project root (one level up from tools/).
+_ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.exists(_ENV_PATH):
+    with open(_ENV_PATH, "r") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
+# Fix SSL cert path on macOS for Python 3.11+
+import certifi
+os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+
+# Fix opus library path on macOS (Homebrew) — ctypes.util.find_library
+# only searches /usr/lib, so it won't find Homebrew's opus. We must
+# monkey-patch the module-level variable before importing the rest of
+# opuslib, which triggers the import at package level.
+import ctypes.util
+_original_find_library = ctypes.util.find_library
+def _patched_find_library(name):
+    if name == 'opus':
+        for p in ['/opt/homebrew/lib/libopus.dylib',
+                  '/opt/homebrew/lib/libopus.0.dylib',
+                  '/usr/local/lib/libopus.dylib']:
+            if os.path.exists(p):
+                return p
+    return _original_find_library(name)
+ctypes.util.find_library = _patched_find_library
+os.environ.setdefault("DYLD_LIBRARY_PATH", "/opt/homebrew/lib")
+
+import opuslib
 
 SERIAL_BAUD = 115200
 FIFO_PATH = os.path.expanduser("~/.claude/buddy_send_fifo")
+ASR_BACKEND = os.environ.get("BUDDY_ASR_BACKEND", "qwen").lower()
+QWEN_MODEL = os.environ.get("BUDDY_ASR_QWEN_MODEL", "paraformer-realtime-v2")
+QWEN_LANGUAGE = os.environ.get("BUDDY_ASR_LANGUAGE", "zh")
+QWEN_LANGUAGE_HINTS = os.environ.get("BUDDY_ASR_LANGUAGE_HINTS", "zh,en").split(",")
 
 
 def find_serial_port():
@@ -217,7 +271,6 @@ def ensure_fifo():
 
 def kill_existing_daemon():
     """Kill any existing buddy_daemon processes to avoid serial port conflicts."""
-    import signal
     my_pid = os.getpid()
     my_ppid = os.getppid()
     try:
@@ -235,9 +288,9 @@ def kill_existing_daemon():
         except ValueError:
             continue
         if pid == my_pid or pid == my_ppid:
-            continue  # don't kill ourselves or our parent
+            continue
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.kill(pid, 9)  # SIGKILL — force kill, no graceful shutdown
             log(f"Killed existing daemon PID {pid}")
         except OSError:
             pass
@@ -259,8 +312,293 @@ def reset_hook_state():
         pass  # file may not exist or be corrupt
 
 
+_LOG_FILE = os.path.expanduser("~/.claude/buddy_voice.log")
 def log(msg):
-    print(f"[buddy_daemon] {msg}", flush=True)
+    ts = time.strftime("%H:%M:%S")
+    line = f"[buddy_daemon] {ts} {msg}"
+    print(line, flush=True)
+    try:
+        with open(_LOG_FILE, "a") as _lf:
+            _lf.write(line + "\n")
+    except Exception:
+        pass
+
+
+# --- Voice push-to-talk -----------------------------------------------------
+
+class VoiceSession:
+    """Reassembles audio_begin/chunk/end JSON commands into a WAV file,
+    transcribes it, pastes the result into the active window, and tracks
+    the pasted character count so a subsequent voice_cancel can delete it.
+    """
+
+    def __init__(self, ser):
+        self.ser = ser
+        self.reset()
+        self.last_pasted_len = 0
+        self._qwen_conv = None  # persistent Qwen WebSocket connection
+
+    def reset(self):
+        self.active = False
+        self.chunks = []         # list[(idx, bytes)]
+        self.codec = "opus_b64"  # default from firmware
+        self.sample_rate = 16000
+        self.bits = 16
+        self.channels = 1
+        self._asr_running = False
+        self._opus_decoder = None
+
+    def begin(self, msg):
+        self.reset()
+        self.active = True
+        self.sample_rate = int(msg.get("sr", 16000))
+        self.bits = int(msg.get("bits", 16))
+        self.channels = int(msg.get("ch", 1))
+        self.codec = msg.get("codec", "opus_b64")
+        self._transcript = None
+
+        if ASR_BACKEND != "qwen":
+            self.pcm_buffer = []
+            self.pcm_bytes = 0
+            log(f"voice: begin sr={self.sample_rate} codec={self.codec} (buffer mode)")
+            return
+
+        self.pcm_buffer = []
+        self.pcm_bytes = 0
+
+        if not self._qwen_conv:
+            self._qwen_connect()
+
+        self._qwen_transcript = None
+        self._qwen_partial = None
+        self._qwen_ready = True
+        log(f"voice: begin sr={self.sample_rate} codec={self.codec} (streaming)")
+
+    def chunk(self, msg):
+        if not self.active:
+            return
+        idx = int(msg.get("i", -1))
+        try:
+            data = base64.b64decode(msg.get("data", ""))
+        except Exception as e:
+            log(f"voice: bad b64 chunk {idx}: {e}")
+            return
+
+        codec = msg.get("codec", self.codec)
+
+        if codec == "opus_b64":
+            try:
+                if self._opus_decoder is None:
+                    self._opus_decoder = opuslib.Decoder(self.sample_rate, self.channels)
+                frame_samples = int(self.sample_rate * 0.02)
+                pcm_frame = self._opus_decoder.decode(bytes(data), frame_samples, decode_fec=False)
+                # Stream to Qwen immediately.
+                if ASR_BACKEND == "qwen" and self._qwen_ready:
+                    self._qwen_conv.append_audio(base64.b64encode(pcm_frame).decode('utf-8'))
+                self.pcm_buffer.append(pcm_frame)
+                self.pcm_bytes += len(pcm_frame)
+            except Exception as e:
+                log(f"voice: opus decode error chunk {idx}: {e}")
+        else:
+            # pcm_b64 fallback
+            self.pcm_buffer.append(data)
+            self.pcm_bytes += len(data)
+            if ASR_BACKEND == "qwen" and self._qwen_ready:
+                self._qwen_conv.append_audio(msg.get("data", ""))
+
+        self.chunks.append((idx, data, codec))
+
+    def end(self, msg):
+        if not self.active:
+            return
+
+        log(f"voice: end {self.pcm_bytes} bytes PCM")
+
+        # Signal Qwen that audio is complete and start transcribing.
+        if ASR_BACKEND == "qwen" and self._qwen_ready:
+            self._qwen_conv.commit()
+
+        # Mark ASR running and reset session-level state BEFORE spawning the
+        # waiter — otherwise reset() would clobber `_asr_running` back to False
+        # and break the cancel guard. Keep `_qwen_transcript` / `_qwen_ready`
+        # untouched so the waiter can read them.
+        self.active = False
+        self.chunks = []
+        self._opus_decoder = None
+        self._asr_running = True
+
+        t = threading.Thread(target=self._transcribe_async, daemon=True)
+        t.start()
+
+    def _transcribe_async(self):
+        """Wait for streaming Qwen transcription result."""
+        t0 = time.time()
+
+        if ASR_BACKEND == "qwen" and self._qwen_ready:
+            for attempt in range(100):  # 10 s max
+                if self._qwen_transcript is not None:
+                    break
+                if attempt == 50:  # log at 5s mark
+                    log(f"voice: still waiting for transcript ({attempt * 0.1:.0f}s)")
+                time.sleep(0.1)
+            text = (self._qwen_transcript or "").strip()
+            if not text and self._qwen_transcript is None:
+                log("voice: transcript never set (no callback received)")
+            elif not text:
+                log("voice: transcript was empty string")
+        else:
+            log("voice: ASR backend not supported in streaming mode")
+            self._asr_running = False
+            self._ack(False, err="unsupported_backend")
+            return
+
+        elapsed = (time.time() - t0) * 1000
+        log(f"voice: ASR done in {elapsed:.0f}ms, transcript_set={self._qwen_transcript is not None}")
+
+        if not text:
+            log("voice: empty transcript")
+            self._asr_running = False
+            self._ack(False, err="empty")
+            return
+        log(f"voice: text=\"{text}\"")
+
+        self._asr_running = False
+        self._ack(True, text=text)
+        self._paste(text)
+
+    def cancel_pasted(self):
+        if self._asr_running:
+            log("voice: cancel — ASR still running, ignoring")
+            return
+        n = self.last_pasted_len
+        self.last_pasted_len = 0
+        if n <= 0:
+            log("voice: cancel — nothing tracked")
+            return
+        log(f"voice: cancel — sending {n} backspaces")
+        script = (f'tell application "System Events" to repeat {n} times\n'
+                  f'  key code 51\nend repeat')
+        try:
+            subprocess.run(["osascript", "-e", script], check=False, timeout=10)
+        except Exception as e:
+            log(f"voice: cancel osascript failed: {e}")
+
+    def press_return(self):
+        self.last_pasted_len = 0  # commit — no longer cancellable
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to key code 36'],
+                check=False, timeout=5,
+            )
+        except Exception as e:
+            log(f"voice: press_return failed: {e}")
+
+    def _qwen_connect(self):
+        """Open a persistent Qwen WebSocket connection for ASR."""
+        api_key = os.environ.get("DASHSCOPE_API_KEY")
+        if not api_key:
+            raise RuntimeError("DASHSCOPE_API_KEY not set")
+        try:
+            import dashscope  # type: ignore
+            from dashscope.audio.qwen_omni import (  # type: ignore
+                OmniRealtimeConversation,
+                OmniRealtimeCallback,
+                AudioFormat,
+                MultiModality,
+            )
+            from dashscope.audio.qwen_omni.omni_realtime import (  # type: ignore
+                TranscriptionParams,
+            )
+        except ImportError:
+            raise RuntimeError("dashscope not installed (pip install dashscope)")
+        dashscope.api_key = api_key
+
+        self._multi_modality_text = MultiModality.TEXT
+
+        # Only the `.completed` event is authoritative — `.text` events stream
+        # in *during* recording with partial fragments, and writing those into
+        # `_qwen_transcript` was racing the `_transcribe_async` waiter, which
+        # would latch onto a partial and skip the real result. Keep the
+        # partials in `_qwen_partial` for diagnostics only.
+        vs = self
+        class _QwenCB(OmniRealtimeCallback):
+            def on_event(self_cb, response):
+                event_type = response.get('type', '')
+                if event_type == 'conversation.item.input_audio_transcription.completed':
+                    transcript = response.get('transcript', '')
+                    log(f"voice: qwen final: \"{transcript}\"")
+                    vs._qwen_transcript = transcript
+                elif event_type == 'conversation.item.input_audio_transcription.text':
+                    text = response.get('text', '')
+                    if text:
+                        vs._qwen_partial = text
+                elif event_type == 'error':
+                    log(f"voice: qwen error: {json.dumps(response, ensure_ascii=False)[:200]}")
+                else:
+                    log(f"voice: qwen event: {event_type}")
+
+        cb = _QwenCB()
+        self._qwen_conv = OmniRealtimeConversation(
+            model='qwen3-asr-flash-realtime',
+            callback=cb,
+        )
+        self._qwen_conv.connect()
+
+        self._qwen_conv.update_session(
+            output_modalities=[MultiModality.TEXT],
+            input_audio_format=AudioFormat.PCM_16000HZ_MONO_16BIT,
+            enable_input_audio_transcription=True,
+            input_audio_transcription_model='qwen3-asr-flash-realtime',
+            enable_turn_detection=False,
+            transcription_params=TranscriptionParams(
+                language=QWEN_LANGUAGE,
+                sample_rate=16000,
+            ),
+        )
+        # SDK bug: transcription_params wipes model from input_audio_transcription.
+        if 'input_audio_transcription' in self._qwen_conv.config:
+            self._qwen_conv.config['input_audio_transcription']['model'] = \
+                'qwen3-asr-flash-realtime'
+        log(f"voice: qwen connected (config={json.dumps(self._qwen_conv.config, default=str, ensure_ascii=False)[:200]})")
+        self._qwen_ready = True
+
+    def _qwen_disconnect(self):
+        if self._qwen_conv:
+            try:
+                self._qwen_conv.close()
+                log("voice: qwen websocket closed")
+            except Exception:
+                pass
+            self._qwen_conv = None
+
+    def _paste(self, text):
+        self.last_pasted_len = len(text)
+        try:
+            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False, timeout=5)
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to keystroke "v" using command down'],
+                check=False, timeout=5,
+            )
+        except Exception as e:
+            log(f"voice: paste failed: {e}")
+
+    def _ack(self, ok, text="", err=""):
+        msg = {"ack": "voice", "ok": bool(ok)}
+        if text:
+            msg["text"] = text
+        if err:
+            msg["err"] = err
+        try:
+            # ensure_ascii=False keeps Chinese as compact UTF-8 (~3 bytes/char)
+            # instead of \uXXXX escapes (~6 bytes), shrinking long-transcript
+            # acks from ~600 bytes to ~250 bytes — small enough to fit in the
+            # device's USB CDC RX ringbuffer comfortably.
+            ser_write(self.ser, (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
+            log(f"voice: ack sent ok={ok}" + (f' text="{text}"' if text else "") + (f" err={err}" if err else ""))
+        except Exception as e:
+            log(f"voice: ack write failed: {e}")
 
 
 def main():
@@ -285,6 +623,7 @@ def main():
         pane_target = f"{session}:{pane}"
 
     log(f"Listening for M5Stick approval responses → tmux send to {pane_target}")
+    log(f"voice: ASR backend = {ASR_BACKEND}")
 
     # --- FIFO for hook scripts → daemon ---
     # Kill any existing daemon instances first
@@ -299,11 +638,26 @@ def main():
     # --- Clear stale hook state so old prompts don't reappear ---
     reset_hook_state()
 
+    # --- Signal handler for clean shutdown ---
+    import signal
+
+    def _shutdown(signum, frame):
+        log("daemon shutting down...")
+        if voice:
+            voice._qwen_disconnect()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
     # --- Reset device state so buddy starts from a clean slate ---
     ser = None
     last_port = None
     ser_fd = None
     last_heartbeat = 0
+    voice = None     # VoiceSession; rebound when ser is (re)opened
+    line_buf = b""   # persists across select cycles — JSON lines (e.g. audio
+                     # chunks) routinely span multiple ser.read() calls.
 
     while True:
         port = find_serial_port()
@@ -320,14 +674,22 @@ def main():
                 import serial
                 ser = serial.Serial(port, SERIAL_BAUD, timeout=0)
                 ser_fd = ser.fileno()
+                voice = VoiceSession(ser)
+                line_buf = b""
                 log(f"Connected to {port}")
+                # Open persistent Qwen WebSocket now so first voice skips connect.
+                if ASR_BACKEND == "qwen":
+                    try:
+                        voice._qwen_connect()
+                    except Exception as e:
+                        log(f"voice: qwen pre-connect failed ({e}), will retry on first use")
                 last_port = port
                 # Reset device state on startup — clear stale prompts,
                 # sessions, etc. so the buddy starts from a clean slate.
                 time.sleep(2)
                 # Drain any stale data from the serial buffer first
                 ser.reset_input_buffer()
-                ser.write(b'{"reset":1,"prompt":{"id":"","tool":"","hint":""},"msg":"ready","total":0,"running":0,"waiting":0}\n')
+                ser_write(ser, b'{"reset":1,"prompt":{"id":"","tool":"","hint":""},"msg":"ready","total":0,"running":0,"waiting":0}\n')
             except ImportError:
                 log("ERROR: pyserial not installed. Run: pip3 install pyserial")
                 sys.exit(1)
@@ -350,7 +712,7 @@ def main():
             try:
                 plat = sys.platform
                 os_name = "macOS" if plat == "darwin" else ("Windows" if plat == "win32" else "Linux")
-                ser.write(json.dumps({
+                ser_write(ser, json.dumps({
                     "daemon": 1,
                     "transport": "usb",
                     "os": os_name,
@@ -383,10 +745,22 @@ def main():
                             data += more
                         except Exception:
                             break
-                    lines = data.decode("utf-8", errors="replace").split("\n")
-                    for line_str in lines:
-                        line_str = line_str.strip()
-                        if not line_str or not line_str.startswith("{"):
+                    line_buf += data
+                    # Keep last fragment (no trailing newline) in line_buf;
+                    # parse the rest. Long base64 audio chunks span many
+                    # 512-byte reads, so we cannot drop partials.
+                    if len(line_buf) > 1 << 20:   # 1 MB sanity cap
+                        log("line buffer overflow — dropping")
+                        line_buf = b""
+                    *complete, line_buf = line_buf.split(b"\n")
+                    for raw in complete:
+                        line_str = raw.decode("utf-8", errors="replace").strip()
+                        if not line_str:
+                            continue
+                        # Forward device debug/diagnostic lines to our log
+                        if not line_str.startswith("{"):
+                            if line_str.startswith("[voice]"):
+                                log(line_str)
                             continue
                         try:
                             msg = json.loads(line_str)
@@ -397,10 +771,25 @@ def main():
                             req_id = msg.get("id", "?")
                             log(f"APPROVE from device (id={req_id[:12]}...) → sending 'Y'")
                             send_to_tmux(pane_target, "Y")
-                        elif approval == "no":
+                            continue
+                        if approval == "no":
                             req_id = msg.get("id", "?")
                             log(f"DENY from device (id={req_id[:12]}...) → sending 'N'")
                             send_to_tmux(pane_target, "N")
+                            continue
+                        cmd = msg.get("cmd")
+                        if cmd == "audio_begin" and voice is not None:
+                            voice.begin(msg)
+                        elif cmd == "audio_chunk" and voice is not None:
+                            voice.chunk(msg)
+                        elif cmd == "audio_end" and voice is not None:
+                            voice.end(msg)
+                        elif cmd == "voice_enter" and voice is not None:
+                            log("voice: ENTER from device")
+                            voice.press_return()
+                        elif cmd == "voice_cancel" and voice is not None:
+                            log("voice: CANCEL from device")
+                            voice.cancel_pasted()
                 except Exception as e:
                     err_str = str(e)
                     # ESP32 USB-Serial often returns "device reports readiness
@@ -422,7 +811,7 @@ def main():
                 try:
                     data = os.read(fifo_fd, 4096)
                     if data:
-                        ser.write(data)
+                        ser_write(ser, data)
                 except Exception:
                     pass
 
