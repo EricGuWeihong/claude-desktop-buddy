@@ -33,21 +33,6 @@ import sys
 import threading
 import time
 
-# Single lock guarding ALL writes to the device serial port. Without this,
-# the heartbeat timer (main thread), FIFO forwarder (main thread), and the
-# voice ACK writer (transcribe sub-thread) can interleave bytes mid-message,
-# corrupting JSON lines on the device. That manifested as the buddy hanging
-# in ANALYZING until the ack timeout because the corrupted ack failed to
-# parse and voiceOnAck was never called.
-_ser_write_lock = threading.Lock()
-
-
-def ser_write(ser, data):
-    if ser is None:
-        return
-    with _ser_write_lock:
-        ser.write(data)
-
 # Load .env from project root (one level up from tools/).
 _ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
 if os.path.exists(_ENV_PATH):
@@ -81,18 +66,83 @@ os.environ.setdefault("DYLD_LIBRARY_PATH", "/opt/homebrew/lib")
 
 import opuslib
 
+# Single lock guarding ALL writes to the device transport. Without this,
+# the heartbeat timer (main thread), FIFO forwarder (main thread), and the
+# voice ACK writer (transcribe sub-thread) can interleave bytes mid-message,
+# corrupting JSON lines on the device. That manifested as the buddy hanging
+# in ANALYZING until the ack timeout because the corrupted ack failed to
+# parse and voiceOnAck was never called.
+_transport_write_lock = threading.Lock()
+
+
+def ser_write(transport, data):
+    """Thread-safe write to the active transport (USB or BLE)."""
+    if transport is None:
+        return
+    with _transport_write_lock:
+        transport.write(data)
+
+
+# --- Transport auto-detection ------------------------------------------------
+
+_BLE_CACHE_PATH = os.path.expanduser("~/.claude/buddy_ble_cache.json")
+
+
+def _load_ble_cache():
+    """Return cached BLE address string, or None."""
+    try:
+        with open(_BLE_CACHE_PATH) as f:
+            return json.load(f).get("address")
+    except Exception:
+        return None
+
+
+def _save_ble_cache(address):
+    try:
+        os.makedirs(os.path.dirname(_BLE_CACHE_PATH), exist_ok=True)
+        with open(_BLE_CACHE_PATH, "w") as f:
+            json.dump({"address": address}, f)
+    except Exception:
+        pass
+
+
+def create_transport():
+    """Auto-detect: USB first, then BLE (macOS only). Returns Transport or None."""
+    # On non-macOS, USB only (existing behavior).
+    if sys.platform != "darwin":
+        from transport_usb import USBTransport
+        t = USBTransport()
+        if t.open():
+            log("Using USB transport")
+            return t
+        return None
+
+    # macOS: try USB first, then BLE.
+    from transport_usb import find_serial_port
+    if find_serial_port():
+        from transport_usb import USBTransport
+        t = USBTransport()
+        if t.open():
+            log("Using USB transport")
+            return t
+        log("USB port found but open failed, trying BLE")
+
+    # Try BLE.
+    log("Scanning for BLE device...")
+    from transport_ble import BLETransport
+    t = BLETransport(cached_address=_load_ble_cache())
+    if t.open():
+        _save_ble_cache(t.address)
+        log(f"Using BLE transport ({t.address})")
+        return t
+    log("No BLE device found")
+    return None
 SERIAL_BAUD = 115200
 FIFO_PATH = os.path.expanduser("~/.claude/buddy_send_fifo")
 ASR_BACKEND = os.environ.get("BUDDY_ASR_BACKEND", "qwen").lower()
 QWEN_MODEL = os.environ.get("BUDDY_ASR_QWEN_MODEL", "paraformer-realtime-v2")
 QWEN_LANGUAGE = os.environ.get("BUDDY_ASR_LANGUAGE", "zh")
 QWEN_LANGUAGE_HINTS = os.environ.get("BUDDY_ASR_LANGUAGE_HINTS", "zh,en").split(",")
-
-
-def find_serial_port():
-    """Return the first /dev/cu.usbmodem* path, or None."""
-    ports = sorted(glob.glob("/dev/cu.usbmodem*"))
-    return ports[0] if ports else None
 
 
 def find_tmux_session():
@@ -313,6 +363,8 @@ def reset_hook_state():
 
 
 _LOG_FILE = os.path.expanduser("~/.claude/buddy_voice.log")
+_DRAGONITE_SYNC_PATH = os.path.expanduser("~/.claude/dragonite_state.json")
+
 def log(msg):
     ts = time.strftime("%H:%M:%S")
     line = f"[buddy_daemon] {ts} {msg}"
@@ -324,6 +376,24 @@ def log(msg):
         pass
 
 
+def _write_dragonite_sync(prompt_id, source):
+    """Write to dragonite_state.json so the Swift desktop app knows
+    this prompt was handled by ESP32. Prevents duplicate approval UIs."""
+    try:
+        os.makedirs(os.path.dirname(_DRAGONITE_SYNC_PATH), exist_ok=True)
+        state = {
+            "last_approver": source,
+            "last_prompt_id": prompt_id,
+            "last_timestamp": time.time(),
+        }
+        tmp = _DRAGONITE_SYNC_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, _DRAGONITE_SYNC_PATH)
+    except Exception:
+        pass  # non-critical — desktop app just won't know about this approval
+
+
 # --- Voice push-to-talk -----------------------------------------------------
 
 class VoiceSession:
@@ -332,8 +402,8 @@ class VoiceSession:
     the pasted character count so a subsequent voice_cancel can delete it.
     """
 
-    def __init__(self, ser):
-        self.ser = ser
+    def __init__(self, transport):
+        self.transport = transport
         self.reset()
         self.last_pasted_len = 0
         self._qwen_conv = None  # persistent Qwen WebSocket connection
@@ -595,7 +665,7 @@ class VoiceSession:
             # instead of \uXXXX escapes (~6 bytes), shrinking long-transcript
             # acks from ~600 bytes to ~250 bytes — small enough to fit in the
             # device's USB CDC RX ringbuffer comfortably.
-            ser_write(self.ser, (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
+            ser_write(self.transport, (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
             log(f"voice: ack sent ok={ok}" + (f' text="{text}"' if text else "") + (f" err={err}" if err else ""))
         except Exception as e:
             log(f"voice: ack write failed: {e}")
@@ -645,63 +715,52 @@ def main():
         log("daemon shutting down...")
         if voice:
             voice._qwen_disconnect()
+        if transport:
+            transport.close()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
     # --- Reset device state so buddy starts from a clean slate ---
-    ser = None
-    last_port = None
-    ser_fd = None
+    transport = None
+    last_transport_type = None  # "usb" | "ble" | None
     last_heartbeat = 0
-    voice = None     # VoiceSession; rebound when ser is (re)opened
+    voice = None     # VoiceSession; rebound when transport is (re)opened
     line_buf = b""   # persists across select cycles — JSON lines (e.g. audio
-                     # chunks) routinely span multiple ser.read() calls.
+                     # chunks) routinely span multiple read() calls.
 
     while True:
-        port = find_serial_port()
-        if port != last_port:
-            if port:
-                log(f"Serial port detected: {port}")
-            else:
-                if last_port:
-                    log("Serial port lost, waiting for reconnect...")
-                last_port = port
-
-        if port and (ser is None or last_port != port):
-            try:
-                import serial
-                ser = serial.Serial(port, SERIAL_BAUD, timeout=0)
-                ser_fd = ser.fileno()
-                voice = VoiceSession(ser)
-                line_buf = b""
-                log(f"Connected to {port}")
-                # Open persistent Qwen WebSocket now so first voice skips connect.
-                if ASR_BACKEND == "qwen":
-                    try:
-                        voice._qwen_connect()
-                    except Exception as e:
-                        log(f"voice: qwen pre-connect failed ({e}), will retry on first use")
-                last_port = port
-                # Reset device state on startup — clear stale prompts,
-                # sessions, etc. so the buddy starts from a clean slate.
+        if transport is None:
+            transport = create_transport()
+            if transport is None:
                 time.sleep(2)
-                # Drain any stale data from the serial buffer first
-                ser.reset_input_buffer()
-                ser_write(ser, b'{"reset":1,"prompt":{"id":"","tool":"","hint":""},"msg":"ready","total":0,"running":0,"waiting":0}\n')
-            except ImportError:
-                log("ERROR: pyserial not installed. Run: pip3 install pyserial")
-                sys.exit(1)
-            except Exception as e:
-                log(f"Open failed: {e}, retrying in 5s...")
-                ser = None
-                ser_fd = None
-                last_port = None
-                time.sleep(5)
                 continue
 
-        if ser is None:
+            transport_type = "usb" if hasattr(transport, "_port") else "ble"
+            if transport_type != last_transport_type:
+                log(f"Transport connected: {transport_type} via {transport.port_name}")
+
+            voice = VoiceSession(transport)
+            line_buf = b""
+            last_transport_type = transport_type
+
+            # Open persistent Qwen WebSocket now so first voice skips connect.
+            if ASR_BACKEND == "qwen":
+                try:
+                    voice._qwen_connect()
+                except Exception as e:
+                    log(f"voice: qwen pre-connect failed ({e}), will retry on first use")
+
+            # Reset device state on startup — clear stale prompts,
+            # sessions, etc. so the buddy starts from a clean slate.
+            time.sleep(2)
+            # Drain any stale data from the input buffer first
+            while transport.read(512):
+                pass
+            ser_write(transport, b'{"reset":1,"prompt":{"id":"","tool":"","hint":""},"msg":"ready","total":0,"running":0,"waiting":0}\n')
+
+        if transport is None:
             time.sleep(2)
             continue
 
@@ -712,34 +771,50 @@ def main():
             try:
                 plat = sys.platform
                 os_name = "macOS" if plat == "darwin" else ("Windows" if plat == "win32" else "Linux")
-                ser_write(ser, json.dumps({
+                ser_write(transport, json.dumps({
                     "daemon": 1,
-                    "transport": "usb",
+                    "transport": "bt" if last_transport_type == "ble" else "usb",
                     "os": os_name,
-                    "port": ser.port if hasattr(ser, "port") else "unknown",
+                    "port": transport.port_name,
                 }).encode() + b"\n")
                 last_heartbeat = now
             except Exception:
                 pass
 
-        # Poll both serial and FIFO with select
-        fds = [ser_fd, fifo_fd]
+        # Poll both transport and FIFO with select
+        transport_fd = transport.fileno()
+        if transport_fd < 0:
+            time.sleep(0.1)
+            continue
+        fds = [transport_fd, fifo_fd]
         try:
             readable, _, _ = select.select(fds, [], [], 0.1)
         except Exception:
             continue
 
+        # Detect BLE disconnect (callback flag) that select missed.
+        if last_transport_type == "ble" and not transport.is_connected:
+            log("BLE connection lost, reconnecting...")
+            try:
+                transport.close()
+            except Exception:
+                pass
+            transport = None
+            last_transport_type = None
+            voice = None
+            continue
+
         for fd in readable:
-            if fd == ser_fd:
+            if fd == transport_fd:
                 # Read from device — look for approval responses
                 try:
-                    data = ser.read(512)
+                    data = transport.read(512)
                     if not data:
                         continue
                     # Drain any pending bytes
                     while True:
                         try:
-                            more = ser.read(512)
+                            more = transport.read(512)
                             if not more:
                                 break
                             data += more
@@ -770,11 +845,13 @@ def main():
                         if approval == "yes":
                             req_id = msg.get("id", "?")
                             log(f"APPROVE from device (id={req_id[:12]}...) → sending 'Y'")
+                            _write_dragonite_sync(req_id, "esp32")
                             send_to_tmux(pane_target, "Y")
                             continue
                         if approval == "no":
                             req_id = msg.get("id", "?")
                             log(f"DENY from device (id={req_id[:12]}...) → sending 'N'")
+                            _write_dragonite_sync(req_id, "esp32")
                             send_to_tmux(pane_target, "N")
                             continue
                         cmd = msg.get("cmd")
@@ -797,21 +874,20 @@ def main():
                     # Don't close/reopen the port; just skip this poll cycle.
                     if "readiness to read" in err_str or "returned no data" in err_str:
                         continue
-                    log(f"Serial read error: {e}")
+                    log(f"Transport read error: {e}")
                     try:
-                        ser.close()
+                        transport.close()
                     except Exception:
                         pass
-                    ser = None
-                    ser_fd = None
-                    last_port = None
+                    transport = None
+                    last_transport_type = None
 
             elif fd == fifo_fd:
                 # Read from hook scripts → forward to device
                 try:
                     data = os.read(fifo_fd, 4096)
                     if data:
-                        ser_write(ser, data)
+                        ser_write(transport, data)
                 except Exception:
                     pass
 

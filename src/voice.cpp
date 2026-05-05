@@ -1,14 +1,20 @@
 #include "voice.h"
+#include "ble_bridge.h"
 #include <M5Unified.h>
 #include <opus.h>
 #include <string.h>
 
-// Voice streams audio over USB serial only — the daemon reads it there.
-// BLE is too slow for bulk audio (NimBLE notification queue overflows).
-// Non-control commands (voice_enter/cancel) still use sendCmd so the
-// daemon picks them up over BLE as well.
+// Voice streams audio over USB serial and BLE NUS. The daemon reads from
+// whichever transport is active (USB on Windows/Linux, BLE on macOS when
+// no USB cable). Control commands (voice_enter/cancel) still use sendCmd
+// so the daemon picks them up over both transports.
 static void voiceSend(const char* json) {
   Serial.println(json);
+  if (bleConnected()) {
+    size_t n = strlen(json);
+    bleWrite((const uint8_t*)json, n);
+    bleWrite((const uint8_t*)"\n", 1);
+  }
 }
 
 // Provided by main.cpp.
@@ -325,6 +331,12 @@ void voiceTick() {
     // the per-tick cost.
     for (int i = 0; i < 4 && _streamOneFrame(); i++) {}
 
+    // Abort if both transports are gone — no point recording to nowhere.
+    if (!bleConnected() && !Serial.dtr()) {
+      voiceCancel();
+      return;
+    }
+
     if (queuedCount + MIC_CHUNK_SAMPLES > recBufSamples) {
       voiceFinishListening();   // 30 s cap (queue can't grow further)
     }
@@ -352,6 +364,14 @@ void voiceTick() {
       voiceSend(tail);
       endSent = true;
       voiceModeEnteredMs = now;
+
+      // If neither transport is available, daemon never receives audio_end
+      // and Qwen times out after 180s. Abort immediately.
+      if (!bleConnected() && !Serial.dtr()) {
+        voiceMode = VOICE_ERROR_FLASH;
+        voiceErrorUntilMs = now + 1500;
+        _resetSend();
+      }
       return;
     }
 

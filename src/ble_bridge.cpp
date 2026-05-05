@@ -24,6 +24,20 @@ static volatile uint32_t     passkey = 0;
 static volatile uint16_t     mtu = 23;
 static NimBLEAdvertising*    adv = nullptr;
 
+// Non-blocking BLE transmit queue. Voice and control data are queued here
+// and drained incrementally each loop iteration — no delay() blocking, so
+// the main loop stays responsive for mic polling and incoming data.
+static const size_t TX_Q_CAP = 32768;  // 32 KB — holds ~30 s of voice burst at MTU=515
+static uint8_t  txQ[TX_Q_CAP];
+static volatile size_t txQHead = 0;    // write pointer (producer)
+static volatile size_t txQTail = 0;    // read pointer (consumer)
+
+static size_t txQUsed() {
+  return (txQHead + TX_Q_CAP - txQTail) % TX_Q_CAP;
+}
+static size_t txQFree() {
+  return TX_Q_CAP - 1 - txQUsed();     // 1 byte sentinel
+}
 static void rxPush(const uint8_t* p, size_t n) {
   for (size_t i = 0; i < n; i++) {
     size_t next = (rxHead + 1) % RX_CAP;
@@ -56,6 +70,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     secure = false;
     passkey = 0;
     mtu = 23;
+    txQHead = 0; txQTail = 0;
     Serial.println("[ble] disconnected");
     adv->start();
   }
@@ -145,16 +160,50 @@ int bleRead() {
 }
 
 size_t bleWrite(const uint8_t* data, size_t len) {
-  if (!connected || !txChar) return 0;
-  size_t chunk = mtu > 3 ? mtu - 3 : 20;
-  if (chunk > 180) chunk = 180;
-  size_t sent = 0;
-  while (sent < len) {
-    size_t n = len - sent;
-    if (n > chunk) n = chunk;
-    txChar->notify((uint8_t*)(data + sent), n);
-    sent += n;
-    delay(4);
+  if (!connected || !txChar || len == 0) return 0;
+  size_t written = 0;
+  while (written < len) {
+    size_t free = txQFree();
+    if (free == 0) break;
+    size_t n = len - written;
+    if (n > free) n = free;
+    size_t seg1 = TX_Q_CAP - txQHead;
+    if (seg1 >= n) {
+      memcpy(txQ + txQHead, data + written, n);
+    } else {
+      memcpy(txQ + txQHead, data + written, seg1);
+      memcpy(txQ, data + written + seg1, n - seg1);
+    }
+    txQHead = (txQHead + n) % TX_Q_CAP;
+    written += n;
   }
-  return sent;
+  return written;
+}
+
+// Drain the BLE transmit queue. Call every loop iteration — sends as many
+// chunks as the BLE stack can absorb in one go, so we don't fall behind
+// when voice produces bursts of data.
+void bleTick() {
+  if (!connected || txQHead == txQTail) return;
+  uint32_t now = millis();
+  size_t chunk = mtu > 3 ? mtu - 3 : 20;
+  if (chunk > 250) chunk = 250;
+
+  // Send as many chunks as possible in one tick. The ESP32 NimBLE stack
+  // queues notifications internally; we just push them through and rely
+  // on the stack's own flow control.
+  for (int i = 0; i < 8; i++) {
+    size_t avail = (txQHead + TX_Q_CAP - txQTail) % TX_Q_CAP;
+    if (avail == 0) return;
+    size_t n = avail < chunk ? avail : chunk;
+    // Contiguous segment (handle wrap at buffer end).
+    size_t seg1 = TX_Q_CAP - txQTail;
+    if (seg1 >= n) {
+      txChar->notify(txQ + txQTail, n);
+    } else {
+      txChar->notify(txQ + txQTail, seg1);
+      txChar->notify(txQ, n - seg1);
+    }
+    txQTail = (txQTail + n) % TX_Q_CAP;
+  }
 }

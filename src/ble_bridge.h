@@ -30,3 +30,5 @@ void bleClearBonds();
 size_t bleAvailable();
 int bleRead();
 size_t bleWrite(const uint8_t* data, size_t len);
+// Drain the non-blocking BLE transmit queue — call every loop iteration.
+void bleTick();
