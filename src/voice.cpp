@@ -332,7 +332,7 @@ void voiceTick() {
     for (int i = 0; i < 4 && _streamOneFrame(); i++) {}
 
     // Abort if both transports are gone — no point recording to nowhere.
-    if (!bleConnected() && !Serial.dtr()) {
+    if (!bleConnected() && !Serial.isConnected()) {
       voiceCancel();
       return;
     }
@@ -367,7 +367,7 @@ void voiceTick() {
 
       // If neither transport is available, daemon never receives audio_end
       // and Qwen times out after 180s. Abort immediately.
-      if (!bleConnected() && !Serial.dtr()) {
+      if (!bleConnected() && !Serial.isConnected()) {
         voiceMode = VOICE_ERROR_FLASH;
         voiceErrorUntilMs = now + 1500;
         _resetSend();
