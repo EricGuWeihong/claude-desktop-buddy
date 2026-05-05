@@ -1155,7 +1155,6 @@ void loop() {
 
   dataPoll(&tama);
   wifiSyncPoll();
-  bleTick();
   soundTick();
   voiceTick();
   if (statsPollLevelUp()) { playLevelUp(); triggerOneShot(P_CELEBRATE, 3000); }
