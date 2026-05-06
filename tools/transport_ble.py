@@ -24,10 +24,17 @@ _CONNECT_TIMEOUT = 15.0
 _SCAN_TIMEOUT    = 8.0
 
 
+_LOG_FILE = os.path.expanduser("~/.claude/buddy_ble.log")
+
 def _log(msg):
     ts = time.strftime("%H:%M:%S")
     line = f"[buddy_ble] {ts} {msg}"
     print(line, flush=True)
+    try:
+        with open(_LOG_FILE, "a") as _lf:
+            _lf.write(line + "\n")
+    except Exception:
+        pass
 
 
 class BLETransport(Transport):

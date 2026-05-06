@@ -143,7 +143,10 @@ size_t bleWrite(const uint8_t* data, size_t len) {
     if (n > chunk) n = chunk;
     txChar->notify((uint8_t*)(data + sent), n);
     sent += n;
-    yield();
+    // Small delay so NimBLE can drain its internal notification queue.
+    // Without this, rapid notify() calls overflow the stack's buffer and
+    // data is silently dropped — the daemon never receives the chunks.
+    delay(1);
   }
   return sent;
 }
