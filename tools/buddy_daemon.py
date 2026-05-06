@@ -783,16 +783,10 @@ def main():
 
         # Poll both transport and FIFO with select
         transport_fd = transport.fileno()
-        if transport_fd < 0:
-            time.sleep(0.1)
-            continue
-        fds = [transport_fd, fifo_fd]
-        try:
-            readable, _, _ = select.select(fds, [], [], 0.1)
-        except Exception:
-            continue
 
-        # Detect BLE disconnect (callback flag) that select missed.
+        # Detect BLE disconnect (callback flag) — must check before the
+        # transport_fd < 0 guard, otherwise fileno() == -1 traps us in
+        # an infinite sleep(0.1) loop that never reaches reconnect logic.
         if last_transport_type == "ble" and not transport.is_connected:
             log("BLE connection lost, reconnecting...")
             try:
@@ -802,6 +796,15 @@ def main():
             transport = None
             last_transport_type = None
             voice = None
+            continue
+
+        if transport_fd < 0:
+            time.sleep(0.1)
+            continue
+        fds = [transport_fd, fifo_fd]
+        try:
+            readable, _, _ = select.select(fds, [], [], 0.1)
+        except Exception:
             continue
 
         for fd in readable:
