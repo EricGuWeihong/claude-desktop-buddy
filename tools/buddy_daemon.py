@@ -731,34 +731,75 @@ def main():
                      # chunks) routinely span multiple read() calls.
 
     while True:
-        if transport is None:
-            transport = create_transport()
-            if transport is None:
-                time.sleep(2)
-                continue
+        # --- Smart transport switching: USB priority with auto-fallback ---
+        # On macOS, prefer USB over BLE. If USB is available, use it. If not,
+        # fall back to BLE. Auto-switch back to USB when it reappears.
+        usb_available = False
+        if sys.platform == "darwin":
+            from transport_usb import find_serial_port
+            usb_available = find_serial_port() is not None
+        else:
+            from transport_usb import find_serial_port
+            usb_available = find_serial_port() is not None
 
-            transport_type = "usb" if hasattr(transport, "_port") else "ble"
-            if transport_type != last_transport_type:
-                log(f"Transport connected: {transport_type} via {transport.port_name}")
-
-            voice = VoiceSession(transport)
-            line_buf = b""
-            last_transport_type = transport_type
-
-            # Open persistent Qwen WebSocket now so first voice skips connect.
-            if ASR_BACKEND == "qwen":
+        if usb_available:
+            # USB is available — prefer it over BLE.
+            if last_transport_type == "ble":
+                log("USB detected, switching from BLE to USB")
                 try:
-                    voice._qwen_connect()
-                except Exception as e:
-                    log(f"voice: qwen pre-connect failed ({e}), will retry on first use")
-
-            # Reset device state on startup — clear stale prompts,
-            # sessions, etc. so the buddy starts from a clean slate.
-            time.sleep(2)
-            # Drain any stale data from the input buffer first
-            while transport.read(512):
-                pass
-            ser_write(transport, b'{"reset":1,"prompt":{"id":"","tool":"","hint":""},"msg":"ready","total":0,"running":0,"waiting":0}\n')
+                    transport.close()
+                except Exception:
+                    pass
+                transport = None
+                last_transport_type = None
+                voice = None
+                # Fall through to create USB transport below.
+            elif transport is None:
+                from transport_usb import USBTransport
+                transport = USBTransport()
+                if not transport.open():
+                    transport = None
+                    time.sleep(2)
+                    continue
+                transport_type = "usb"
+                log(f"Transport connected: {transport_type} via {transport.port_name}")
+                voice = VoiceSession(transport)
+                line_buf = b""
+                last_transport_type = transport_type
+                if ASR_BACKEND == "qwen":
+                    try:
+                        voice._qwen_connect()
+                    except Exception as e:
+                        log(f"voice: qwen pre-connect failed ({e}), will retry on first use")
+                time.sleep(2)
+                while transport.read(512):
+                    pass
+                ser_write(transport, b'{"reset":1,"prompt":{"id":"","tool":"","hint":""},"msg":"ready","total":0,"running":0,"waiting":0}\n')
+        else:
+            # No USB — need BLE.
+            if transport is None or last_transport_type == "usb":
+                log("Scanning for BLE device...")
+                from transport_ble import BLETransport
+                transport = BLETransport(cached_address=_load_ble_cache())
+                if not transport.open():
+                    transport = None
+                    time.sleep(2)
+                    continue
+                _save_ble_cache(transport.address)
+                transport_type = "ble"
+                log(f"Transport connected: {transport_type} via {transport.port_name}")
+                voice = VoiceSession(transport)
+                line_buf = b""
+                last_transport_type = transport_type
+                if ASR_BACKEND == "qwen":
+                    try:
+                        voice._qwen_connect()
+                    except Exception as e:
+                        log(f"voice: qwen pre-connect failed ({e}), will retry on first use")
+                time.sleep(2)
+                while transport.read(512):
+                    pass
+                ser_write(transport, b'{"reset":1,"prompt":{"id":"","tool":"","hint":""},"msg":"ready","total":0,"running":0,"waiting":0}\n')
 
         if transport is None:
             time.sleep(2)
@@ -837,7 +878,6 @@ def main():
                         line_str = raw.decode("utf-8", errors="replace").strip()
                         if not line_str:
                             continue
-                        # Forward device debug/diagnostic lines to our log
                         if not line_str.startswith("{"):
                             if line_str.startswith("[voice]"):
                                 log(line_str)
