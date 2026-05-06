@@ -141,7 +141,7 @@ class BLETransport(Transport):
                 future.set_exception(e)
 
         self._loop.call_soon_threadsafe(
-            lambda: asyncio.ensure_future(_wrap()),
+            lambda: self._loop.create_task(_wrap()),
         )
         return future.result(timeout=_CONNECT_TIMEOUT)
 
@@ -243,7 +243,8 @@ class BLETransport(Transport):
 
     @property
     def is_connected(self) -> bool:
-        return self._connected
+        """Actively probe BLE client — don't trust cached state."""
+        return self.check_connected()
 
     @property
     def port_name(self) -> str:

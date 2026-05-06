@@ -787,7 +787,9 @@ def main():
         # Detect BLE disconnect (callback flag) — must check before the
         # transport_fd < 0 guard, otherwise fileno() == -1 traps us in
         # an infinite sleep(0.1) loop that never reaches reconnect logic.
-        if last_transport_type == "ble" and not transport.is_connected:
+        # Actively probe via check_connected() to catch stale connections
+        # that the callback may have missed.
+        if last_transport_type == "ble" and not transport.check_connected():
             log("BLE connection lost, reconnecting...")
             try:
                 transport.close()

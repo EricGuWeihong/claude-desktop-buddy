@@ -71,10 +71,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
     passkey = 0;
     secure = desc->sec_state.encrypted;
-    Serial.printf("[ble] auth %s\n", secure ? "ok" : "FAIL");
-    if (!secure && server) {
-      server->disconnect(desc->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-    }
+    Serial.printf("[ble] auth %s enc=%d\n", secure ? "ok" : "no", secure);
+    // Don't force-disconnect on unencrypted — we run without BLE security now.
   }
 };
 
