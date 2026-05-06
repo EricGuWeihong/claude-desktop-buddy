@@ -860,11 +860,15 @@ def main():
                             send_to_tmux(pane_target, "N")
                             continue
                         cmd = msg.get("cmd")
+                        if cmd in ("audio_begin", "audio_chunk", "audio_end") and voice is None:
+                            log(f"voice: {cmd} DROPPED — voice session is None")
                         if cmd == "audio_begin" and voice is not None:
+                            log(f"voice: begin sr={msg.get('sr')} codec={msg.get('codec')}")
                             voice.begin(msg)
                         elif cmd == "audio_chunk" and voice is not None:
                             voice.chunk(msg)
                         elif cmd == "audio_end" and voice is not None:
+                            log(f"voice: end {voice.pcm_bytes} bytes PCM")
                             voice.end(msg)
                         elif cmd == "voice_enter" and voice is not None:
                             log("voice: ENTER from device")

@@ -229,22 +229,15 @@ class BLETransport(Transport):
                     _log(f"BLE write failed: {e}")
 
     def check_connected(self) -> bool:
-        """Check actual BLE client state (detects stale connections)."""
-        if self._client:
-            try:
-                actual = self._client.is_connected
-                if not actual:
-                    self._connected = False
-                return actual
-            except Exception:
-                self._connected = False
-                return False
+        """Check cached connection state — set by BLE thread's disconnect
+        callback.  Do NOT cross thread boundaries to query bleak client
+        directly; CoreBluetooth is not thread-safe and this caused silent
+        voice failures under heavy BLE notification load."""
         return self._connected
 
     @property
     def is_connected(self) -> bool:
-        """Actively probe BLE client — don't trust cached state."""
-        return self.check_connected()
+        return self._connected
 
     @property
     def port_name(self) -> str:
