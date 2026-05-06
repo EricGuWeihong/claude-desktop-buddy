@@ -43,9 +43,8 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
     connected = true;
-    Serial.printf("[ble] connected (handle=%u enc=%d)\n",
-                  desc->conn_handle, desc->sec_state.encrypted);
-    NimBLEDevice::startSecurity(desc->conn_handle);
+    Serial.printf("[ble] connected (handle=%u)\n",
+                  desc->conn_handle);
   }
   void onDisconnect(NimBLEServer* s) override {
     connected = false;
@@ -83,9 +82,6 @@ void bleInit(const char* deviceName) {
   NimBLEDevice::init(deviceName);
   NimBLEDevice::setMTU(517);
 
-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
-  NimBLEDevice::setSecurityAuth(true, true, true); // MITM, bond, SC
-
   server = NimBLEDevice::createServer();
   server->setCallbacks(new ServerCallbacks());
 
@@ -93,12 +89,12 @@ void bleInit(const char* deviceName) {
 
   txChar = svc->createCharacteristic(
     NUS_TX_UUID,
-    NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ_ENC
+    NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ
   );
 
   rxChar = svc->createCharacteristic(
     NUS_RX_UUID,
-    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
   );
   rxChar->setCallbacks(new RxCallbacks());
 
